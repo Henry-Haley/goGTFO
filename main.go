@@ -19,8 +19,8 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/aaron-kidwell/goLoL/internal/mitre"
-	"github.com/aaron-kidwell/goLoL/internal/privileges"
+	"github.com/Henry-Haley/goGTFO/internal/mitre"
+	"github.com/Henry-Haley/goGTFO/internal/privileges"
 )
 
 type lolbasCommand struct {
