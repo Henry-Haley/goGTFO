@@ -1126,7 +1126,7 @@ Add one small GitHub Actions workflow that:
 ### Cleanup tasks
 
 - [ ] Run `rg -n -i 'lolbas|loldriver|windows|administrator|system32|\.exe|\.sys|windir|programfiles|wintrust|authenticode|driverquery|sc\.exe'` and inspect every remaining match.
-- [ ] Run `rg -n 'github\.com/aaron-kidwell/goLoL|aaron-kidwell/goLoL'` and require no matches.
+- [ ] Run `rg -n --glob '!plan.md' 'github\.com/aaron-kidwell/goLoL|aaron-kidwell/goLoL'` and require no matches outside this historical specification.
 - [ ] Run `rg -n 'os/exec|exec\.Command|CommandContext'` and confirm every child process is the planned non-interactive sudo probe or test fake.
 - [ ] Confirm no remote code path reaches command execution.
 - [ ] Confirm `.gitignore` covers local binaries.
