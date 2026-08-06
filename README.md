@@ -1,193 +1,77 @@
-# goLoL
+# goGTFO
 
-**goLoL** is a Windows host scanner with dual support for **[LOLBAS](https://lolbas-project.github.io/)** binaries and **[LOLDrivers](https://www.loldrivers.io/)**. It lists LOLBAS techniques runnable at your current privilege level (with MITRE ATT&CK mappings) and can scan local `.sys` files for vulnerable/malicious LOLDrivers hash matches.
-**Note:** This is not an OPSEC safe tool.
-**Author:** Aaron Kidwell
+> **Development status:** goGTFO is under active conversion and is not yet release-ready or suitable for use as a stable security tool.
 
-```
-                   █████                █████      
-                  ░░███                ░░███       
-  ███████  ██████  ░███         ██████  ░███       
- ███░░███ ███░░███ ░███        ███░░███ ░███       
-░███ ░███░███ ░███ ░███       ░███ ░███ ░███       
-░███ ░███░███ ░███ ░███      █░███ ░███ ░███      █
-░░███████░░██████  ███████████░░██████  ███████████
- ░░░░░███ ░░░░░░  ░░░░░░░░░░░  ░░░░░░  ░░░░░░░░░░░ 
- ███ ░███                                          
-░░██████                                           
- ░░░░░░                                            
+goGTFO is a Linux host scanner under active development that identifies installed GTFOBins executables and evaluates documented techniques against the host's unprivileged, SUID, file-capability, and sudo contexts, with MITRE ATT&CK mappings and example commands.
 
-```
+goGTFO is a Linux-focused adaptation of [goLoL](https://github.com/aaron-kidwell/goLoL), originally created by Aaron Kidwell.
 
-![goLoL interactive terminal output](docs/screenshot.png)
+Maintainer: Henry Haley
 
-## Features
+## Current development status
 
-- **Live LOLBAS catalog**: pulls the latest entries from [lolbas-project.github.io](https://lolbas-project.github.io/api/lolbas.json)
-- **On-disk detection**: resolves documented paths to local `%WINDIR%`, `%ProgramFiles%`, `%USERPROFILE%`, and WindowsApps locations
-- **Privilege-aware filtering**: shows only techniques runnable at your current tier
-- **MITRE ATT&CK labels**: technique IDs mapped to readable names (e.g. `T1003.003: NTDS`)
-- **Flexible sorting**: group by binary, privilege tier, or ATT&CK technique
-- **Driver mode**: hashes local `.sys` files and matches against the live [LOLDrivers](https://www.loldrivers.io/) JSON catalog
-- **Plain output mode**: ASCII-only output for telnet, reverse shells, and other unstable terminals
-- **Lightweight scanning**: filesystem checks via Go APIs; admin-group detection uses `net localgroup` (one child process on Windows)
+- Phase 0 established the repository, conversion specification, Go 1.26.5 toolchain, and baseline.
+- Phase 1 established a Linux-only build and removed Windows console handling and LOLDrivers functionality.
+- The GTFOBins catalog model, live fetching, executable discovery, applicability evaluation, final output, tests, CI, and releases are still being implemented.
+- The `linux-gtfobins-port` branch is a development branch and must not yet be treated as a stable security tool.
 
-## Privilege tiers
+Any remaining legacy LOLBAS paths are temporary conversion scaffolding, not supported goGTFO functionality.
 
-| Your context | What you see |
-|---|---|
-| Standard user | User-tier techniques |
-| Member of local **Administrators** | User-tier + admin-tier techniques |
-| **NT AUTHORITY\\SYSTEM** | User-tier + admin-tier + SYSTEM-tier techniques |
+## Planned functionality
 
-Admin-tier commands may still require an elevated shell even if your account is in the Administrators group. SYSTEM-tier entries are hidden unless the process token is SYSTEM (`S-1-5-18`).
+- Live retrieval of the official GTFOBins catalog.
+- PATH-based executable discovery.
+- Unprivileged-context findings.
+- SUID applicability analysis.
+- Linux file-capability analysis.
+- Sudo-policy evidence.
+- Alias and inheritance handling.
+- MITRE ATT&CK mappings.
+- Human-readable and structured output.
+- Explicit applicability states distinguishing `confirmed`, `potential`, `unknown`, and `unavailable` techniques.
+- Display-only handling of commands supplied by the GTFOBins catalog; catalog commands will never be executed.
+
+## Safety model
+
+goGTFO displays documented catalog techniques but does not execute them. It is intended only for authorized assessment, lab, and educational use and must be run only on systems you own or have explicit permission to assess.
+
+goGTFO is not an OPSEC-safe tool. A displayed technique is not a guarantee that the command will succeed because host policy, configuration, versions, and runtime conditions may still prevent it.
 
 ## Requirements
 
-- **Windows** (primary target; non-Windows builds stub out privilege checks)
-- **Go 1.21+** (project uses Go 1.26.2)
-- **Network access** to fetch LOLBAS/LOLDrivers catalogs on each run (not cached offline)
+- Linux.
+- Go 1.26.5.
+- Network access for future live GTFOBins catalog retrieval.
 
-## Install
+## Development build
 
-**Remote install** (requires a tagged release on GitHub, e.g. `v0.1.0`):
-
-```bash
-go install github.com/aaron-kidwell/goLoL@latest
-```
-
-The binary is placed in your `GOPATH/bin` (or `~/go/bin`). On Windows, ensure that directory is on your `PATH`.
-
-**Clone and build:**
+There are no stable releases or packaged binaries yet. To build the current development branch:
 
 ```bash
-git clone https://github.com/aaron-kidwell/goLoL.git
-cd goLoL
-go build -ldflags="-s -w" -trimpath -o golol.exe .
+git clone https://github.com/Henry-Haley/goGTFO.git
+cd goGTFO
+git switch linux-gtfobins-port
+go test ./...
+go build -o goGTFO .
 ```
 
-## Usage
+The resulting binary is a transitional development build, not a completed GTFOBins scanner.
 
-`goLoL` supports two scan modes:
-- **LOLBAS mode (default)** for living-off-the-land binaries and privilege-filtered techniques
-- **LOLDrivers mode** via `-driver` for vulnerable/malicious driver hash matches
+## Project status
 
-Run from the module root (required for `internal/` packages):
-
-```bash
-go run .
-```
-
-Build a binary (recommended.. strips debug info, ~30% smaller):
-
-```bash
-go build -ldflags="-s -w" -trimpath -o golol.exe .
-.\golol.exe
-```
-
-`-s -w` removes the symbol table and DWARF debug data. A default `go build` on this project is ~9.5 MB; with those flags it drops to ~6.4 MB.
-
-### Flags
-
-| Flag | Description |
-|---|---|
-| `-h`, `-help` | Show help |
-| `-driver` | Scan local drivers and list known vulnerable/malicious matches from LOLDrivers |
-| `-plain` | ASCII-only output (no colors, Unicode, or cursor control) |
-| `-s`, `-search` | Show one binary by name (`certutil` or `certutil.exe`); reports if not on disk |
-| `-sort` | Sort results: `binary` (default), `privilege`, or `attack` |
-
-Sort aliases: `b`, `priv` / `p`, `mitre` / `a`. Invalid values print an error and show help.
-
-### Examples
-
-```bash
-# Default: grouped by binary name (A-Z)
-go run .
-
-# Driver mode (scan local .sys files against LOLDrivers hashes)
-go run . -driver
-
-# Look up a single binary
-go run . -s certutil
-.\golol.exe -s certutil.exe
-
-# Admin tier first, then user tier (SYSTEM tier first when running as SYSTEM)
-go run . -sort privilege
-
-# Sorted by MITRE ATT&CK ID
-go run . -sort attack
-
-# Reverse shell / telnet friendly output
-go run . -plain
-
-# Combine flags
-go run . -plain -sort attack
-```
-
-### Example output
-
-Counts and binaries vary by host. The screenshot at the top of this README shows interactive mode (colored terminal, grouped by binary).
-
-**Plain mode** (`-plain`):
-
-```
-[*] Checking process token...
-[*] Fetching LOLBAS catalog...
-[+] Found 147 binaries, 299 techniques
-
-==============================================================
-Role:        administrator
-Sort:        binary
-Binaries:    147
-Techniques:  299
-==============================================================
-
-  [1] Esentutl.exe
-  Path:          C:\Windows\System32\esentutl.exe
-  ...
-```
-
-## How it works
-
-1. Detects the current process privilege context (standard user, local admin group member, or SYSTEM).
-2. In default mode, downloads and parses the LOLBAS JSON catalog.
-3. For each LOLBAS entry, remaps documented paths to the local filesystem and checks whether the binary exists.
-4. Filters commands by privilege tier and deduplicates by resolved on-disk path.
-5. In `-driver` mode, downloads the LOLDrivers JSON catalog, hashes local `.sys` files, and reports hash matches.
-6. Prints results with paths, ATT&CK technique, use case, and example command (or driver match metadata in `-driver` mode).
-
-| Component | Location |
-|---|---|
-| LOLBAS catalog | `https://lolbas-project.github.io/api/lolbas.json` |
-| LOLDrivers catalog | `https://www.loldrivers.io/api/drivers.json` |
-| Privilege detection | `internal/privileges` |
-| MITRE technique names | `internal/mitre` |
-| Path resolution & output | `main.go` |
-
-## Project layout
-
-```
-.
-├── docs/
-│   └── screenshot.png            # README screenshot
-├── main.go
-├── internal/
-│   ├── mitre/
-│   │   └── names.go              # MITRE ATT&CK ID to label map
-│   └── privileges/
-│       ├── privileges_windows.go # Token / Administrators group checks
-│       └── privileges_stub.go    # Non-Windows stub
-├── go.mod
-└── go.sum
-```
+| Phase                                      | Status      |
+| ------------------------------------------ | ----------- |
+| Repository preparation and baseline        | Complete    |
+| Linux-only build conversion                | Complete    |
+| GTFOBins catalog models                    | Not started |
+| Live catalog client                        | Not started |
+| Executable discovery                       | Not started |
+| Alias and inheritance resolution           | Not started |
+| Host applicability inspection              | Not started |
+| Evaluation and rendering                   | Not started |
+| Final orchestration                        | Not started |
+| CI, documentation, and release preparation | Not started |
 
 ## Disclaimer
 
-For **authorized** security testing, lab use, and education only. Only run against systems you own or have explicit permission to assess. LOLBAS entries describe techniques that may be abused by attackers, so use responsibly. The author is not responsible for misuse.
-
-Technique and metadata are sourced from the [LOLBAS Project](https://github.com/LOLBAS-Project/LOLBAS) and [LOLDrivers](https://github.com/magicsword-io/LOLDrivers). goLoL is not affiliated with or endorsed by either project.
-
-## License
-
-MIT
+For authorized security testing, lab use, and education only. Run goGTFO only on systems you own or have explicit permission to assess. You are responsible for complying with applicable laws, policies, and rules of engagement. The project maintainers and original author are not responsible for misuse.
