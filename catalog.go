@@ -2,10 +2,19 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
+	"time"
+	"unicode"
+)
+
+const (
+	gtfoBinsAPIURL         = "https://gtfobins.org/api.json"
+	maxCatalogResponseSize = 5 << 20
 )
 
 type catalog struct {
@@ -67,13 +76,63 @@ type companionDef struct {
 
 func decodeCatalog(r io.Reader) (catalog, error) {
 	var c catalog
-	if err := json.NewDecoder(r).Decode(&c); err != nil {
+	decoder := json.NewDecoder(r)
+	if err := decoder.Decode(&c); err != nil {
 		return catalog{}, fmt.Errorf("decode catalog: %w", err)
 	}
+
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return catalog{}, fmt.Errorf("decode catalog: trailing JSON value")
+		}
+		return catalog{}, fmt.Errorf("decode trailing catalog data: %w", err)
+	}
+
 	if err := validateCatalog(c); err != nil {
-		return catalog{}, err
+		return catalog{}, fmt.Errorf("validate catalog: %w", err)
 	}
 	return c, nil
+}
+
+func fetchCatalog(ctx context.Context) (catalog, error) {
+	return fetchCatalogFrom(ctx, &http.Client{Timeout: 15 * time.Second}, gtfoBinsAPIURL)
+}
+
+func fetchCatalogFrom(ctx context.Context, client *http.Client, endpoint string) (catalog, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return catalog{}, fmt.Errorf("create catalog request: %w", err)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return catalog{}, fmt.Errorf("fetch catalog: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return catalog{}, fmt.Errorf("fetch catalog: unexpected HTTP status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxCatalogResponseSize+1))
+	if err != nil {
+		return catalog{}, fmt.Errorf("read catalog response: %w", err)
+	}
+	if len(body) > maxCatalogResponseSize {
+		return catalog{}, fmt.Errorf("read catalog response: body exceeds %d-byte limit", maxCatalogResponseSize)
+	}
+
+	return decodeCatalog(bytes.NewReader(body))
+}
+
+func sanitizeTerminalText(text string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' || unicode.IsPrint(r) {
+			return r
+		}
+		return -1
+	}, text)
 }
 
 func validateCatalog(c catalog) error {

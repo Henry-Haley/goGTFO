@@ -1,10 +1,17 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
+	"unicode"
 )
 
 func TestDecodeCatalogFixture(t *testing.T) {
@@ -86,6 +93,119 @@ func TestDecodeCatalogFixture(t *testing.T) {
 	}
 }
 
+func TestFetchCatalogSuccessUsesGET(t *testing.T) {
+	payload := fixtureCatalogJSON(t)
+	methods := make(chan string, 1)
+
+	c, err := fetchFromTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		methods <- r.Method
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write(payload)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if method := <-methods; method != http.MethodGet {
+		t.Fatalf("request method = %q, want GET", method)
+	}
+	if _, ok := c.Executables["fixture-tool"]; !ok {
+		t.Fatal("fixture catalog was not returned")
+	}
+}
+
+func TestFetchCatalogNonOKReturnsErrorWithoutPrinting(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, "server-body-must-not-leak\x1b[2J")
+	}))
+	defer server.Close()
+
+	var fetchErr error
+	output := captureProcessOutput(t, func() {
+		_, fetchErr = fetchCatalogFrom(context.Background(), server.Client(), server.URL)
+	})
+	if fetchErr == nil || !strings.Contains(fetchErr.Error(), "HTTP status 503") {
+		t.Fatalf("error = %v, want HTTP status 503", fetchErr)
+	}
+	if strings.Contains(fetchErr.Error(), "server-body") {
+		t.Fatalf("server body leaked into error: %v", fetchErr)
+	}
+	if output != "" {
+		t.Fatalf("fetch printed %q instead of returning its error", output)
+	}
+}
+
+func TestFetchCatalogResponseSizeLimit(t *testing.T) {
+	valid := fixtureCatalogJSON(t)
+	exact := bytes.Repeat([]byte(" "), maxCatalogResponseSize)
+	copy(exact, valid)
+	over := bytes.Repeat([]byte(" "), maxCatalogResponseSize+1)
+
+	t.Run("exactly limit", func(t *testing.T) {
+		c, err := fetchFromTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Length", strconv.Itoa(len(exact)))
+			_, _ = w.Write(exact)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := c.Executables["fixture-tool"]; !ok {
+			t.Fatal("exact-limit catalog was not returned")
+		}
+	})
+
+	t.Run("over limit", func(t *testing.T) {
+		_, err := fetchFromTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Length", strconv.Itoa(len(over)))
+			_, _ = w.Write(over)
+		})
+		if err == nil || !strings.Contains(err.Error(), "exceeds 5242880-byte limit") {
+			t.Fatalf("error = %v, want size-limit error", err)
+		}
+	})
+
+	t.Run("over limit without content length", func(t *testing.T) {
+		_, err := fetchFromTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			_, _ = w.Write(over)
+		})
+		if err == nil || !strings.Contains(err.Error(), "exceeds 5242880-byte limit") {
+			t.Fatalf("error = %v, want size-limit error", err)
+		}
+	})
+}
+
+func TestFetchCatalogJSONDocumentBoundary(t *testing.T) {
+	valid := fixtureCatalogJSON(t)
+	tests := []struct {
+		name    string
+		payload []byte
+		wantErr string
+	}{
+		{"invalid JSON", []byte(`{"functions":`), "decode catalog"},
+		{"trailing JSON value", append(append([]byte(nil), valid...), []byte(` {"second":true}`)...), "trailing JSON value"},
+		{"trailing whitespace", append(append([]byte(nil), valid...), []byte("\n\t  ")...), ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := fetchFromTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write(tt.payload)
+			})
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestCatalogRequiredSections(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -102,7 +222,9 @@ func TestCatalogRequiredSections(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := decodeCatalog(strings.NewReader(tt.input))
+			_, err := fetchFromTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, tt.input)
+			})
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("error = %v, want containing %q", err, tt.want)
 			}
@@ -143,8 +265,58 @@ func TestUnknownJSONFieldsAreTolerated(t *testing.T) {
 		"executables":{"fixture":{"future":true,"functions":{"command":[{"contexts":{"unprivileged":null},"future":true}]}}},
 		"future":true
 	}`
-	if _, err := decodeCatalog(strings.NewReader(input)); err != nil {
+	if _, err := fetchFromTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, input)
+	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestFetchCatalogPropagatesValidationError(t *testing.T) {
+	input := `{"functions":{"command":{}},"contexts":{"unprivileged":{}},"executables":{"fixture/tool":{}}}`
+	_, err := fetchFromTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, input)
+	})
+	if err == nil || !strings.Contains(err.Error(), "validate catalog: invalid executable name") {
+		t.Fatalf("error = %v, want wrapped validation error", err)
+	}
+}
+
+func TestSanitizeTerminalText(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"ASCII", "plain ASCII 123", "plain ASCII 123"},
+		{"Unicode", "café 漢字 🙂", "café 漢字 🙂"},
+		{"newline", "first\nsecond", "first\nsecond"},
+		{"tab", "left\tright", "left\tright"},
+		{"escape", "a\x1bb", "ab"},
+		{"ANSI sequence", "before\x1b[2Jafter", "before[2Jafter"},
+		{"carriage return", "before\rafter", "beforeafter"},
+		{"backspace", "before\bafter", "beforeafter"},
+		{"DEL", "before\x7fafter", "beforeafter"},
+		{"other C0 controls", "\x00\x01\x02\x0b\x0c\x1f", ""},
+		{"mixed", "start\x1b[31mred\x1b[0m\r\n\tend\x7f", "start[31mred[0m\n\tend"},
+		{"empty", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sanitizeTerminalText(tt.input)
+			if got != tt.want {
+				t.Fatalf("sanitizeTerminalText(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+			if strings.Contains(got, "\x1b[2J") {
+				t.Fatalf("ANSI control sequence survived intact: %q", got)
+			}
+			for _, r := range got {
+				if r != '\n' && r != '\t' && !unicode.IsPrint(r) {
+					t.Fatalf("control character U+%04X survived in %q", r, got)
+				}
+			}
+		})
 	}
 }
 
@@ -190,4 +362,47 @@ func validCatalog(name string) catalog {
 		Contexts:    map[string]contextMeta{"unprivileged": {}},
 		Executables: map[string]executableDef{name: {}},
 	}
+}
+
+func fixtureCatalogJSON(t *testing.T) []byte {
+	t.Helper()
+	payload, err := os.ReadFile("testdata/catalog.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}
+
+func fetchFromTestServer(t *testing.T, handler http.HandlerFunc) (catalog, error) {
+	t.Helper()
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	return fetchCatalogFrom(context.Background(), server.Client(), server.URL)
+}
+
+func captureProcessOutput(t *testing.T, fn func()) string {
+	t.Helper()
+
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldStdout, oldStderr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = write, write
+	defer func() {
+		os.Stdout, os.Stderr = oldStdout, oldStderr
+		_ = read.Close()
+		_ = write.Close()
+	}()
+
+	fn()
+	os.Stdout, os.Stderr = oldStdout, oldStderr
+	if err := write.Close(); err != nil {
+		t.Fatal(err)
+	}
+	output, err := io.ReadAll(read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(output)
 }
