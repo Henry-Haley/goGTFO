@@ -1,8 +1,8 @@
-# goLoL Linux / GTFOBins Conversion Plan
+# goGTFO Linux / GTFOBins Conversion Plan
 
 ## Document purpose
 
-This is the implementation specification for converting goLoL from a Windows/LOLBAS scanner into a Linux/GTFOBins scanner. It is intended to be handed directly to an implementation agent and followed phase by phase.
+This is the implementation specification for converting goGTFO from its synchronized Windows/LOLBAS and LOLDrivers baseline into a Linux/GTFOBins scanner. It is intended to be handed directly to an implementation agent and followed phase by phase.
 
 The plan is deliberately detailed because it defines the product's truth model, security boundaries, data handling, file layout, implementation order, tests, and release gates. An implementation is not complete merely because it builds or prints GTFOBins entries; it must accurately distinguish what the host confirms from what remains conditional.
 
@@ -33,6 +33,7 @@ The converted program will:
 - Preserve the current search, sorting, colored output, and plain-terminal experience where those behaviors remain useful.
 - Never execute a GTFOBins technique.
 - Remain small: standard library plus the already-present `golang.org/x/sys` module.
+- Contain no LOLDrivers endpoint, local driver scan, or `-driver` mode.
 
 ## Product truth model
 
@@ -73,7 +74,7 @@ The program must never convert `unknown` into `confirmed` for convenience. User-
 
 ### Explicit non-goals
 
-- Windows or LOLBAS compatibility.
+- Windows, LOLBAS, or LOLDrivers compatibility.
 - macOS, BSD, or other Unix support.
 - Recursive full-filesystem executable discovery.
 - Automatically running `find`, `getcap -r`, package managers, `--version`, or catalog examples.
@@ -90,7 +91,7 @@ These are not placeholders that require scaffolding. Add them later only when a 
 
 ## Current repository assessment
 
-The current repository has approximately 1,133 lines of Go and no tests.
+The synchronized upstream baseline is a Windows scanner with both LOLBAS and LOLDrivers functionality and no tests.
 
 ### Existing code to replace
 
@@ -101,6 +102,12 @@ The current repository has approximately 1,133 lines of Go and no tests.
 - Case-insensitive path deduplication.
 - LOLBAS-specific help, labels, status messages, and disclaimers.
 - The fetch URL and result-building loop.
+- LOLDrivers models: `lolDriverSample`, `lolDriverCommand`, `lolDriverEntry`, `localDriver`, and `driverMatch`.
+- LOLDrivers catalog fetching in `fetchLOLDriversCatalog` from `https://www.loldrivers.io/api/drivers.json`.
+- Local `.sys` discovery and SHA-256 work in `driverSearchRoots`, `hashFileSHA256`, `collectLocalDrivers`, and `findVulnerableDrivers`.
+- Loaded-driver inspection in `normalizeDriverName`, `loadedDriverNames`, and `annotateLoadedState`, including the `sc.exe` and `driverquery` child processes.
+- Driver-mode orchestration and rendering in `runDriverMode`, `printDriverResults`, `statusDisplay`, `boolDisplay`, `firstNonEmpty`, `firstSampleDescription`, and `firstCommand`.
+- The `driverFlag` declaration, `-driver` validation/dispatch, help text, tests, and documentation. The flag will not be retained.
 
 ### Existing code to reuse with targeted edits
 
@@ -129,19 +136,30 @@ The current repository has approximately 1,133 lines of Go and no tests.
 These decisions should not be revisited during implementation unless evidence makes them impossible:
 
 1. **Retarget instead of dual-platform support.** The command becomes Linux-only.
-2. **Keep the module path.** Do not rename the GitHub repository or Go module during the functional conversion.
-3. **Build the binary as `golol`.** Remove `.exe` from documentation and build outputs.
-4. **Use the official JSON API.** Do not scrape HTML and do not parse the source YAML repository.
-5. **Fetch live on each run.** Match the original application's always-current behavior; add caching only after a real offline requirement appears.
-6. **Use PATH discovery by default.** It is fast, predictable, and matches executables the current shell can invoke.
-7. **Do not recursively scan `/`.** Off-PATH SUID/capability discovery is a later opt-in feature, not part of the initial implementation.
-8. **Do not automatically inspect program versions.** Version commands are inconsistent and may have side effects. Preserve version text and downgrade applicability to `unknown`.
-9. **Do not prompt for sudo.** Optional sudo checks use `sudo -n` and have a global timeout.
-10. **Do not parse catalog snippets.** Shell syntax is too varied to safely derive executable arguments or prerequisites.
-11. **Do not rewrite alias commands.** Display the official target command and clearly identify the alias chain.
-12. **Use no new library for capability inspection.** Use `golang.org/x/sys/unix`, which is already in `go.mod`.
-13. **Use a synthetic test fixture.** Do not commit a snapshot of the GPL-licensed live API.
-14. **Unknown API fields remain forward-compatible.** Decode required fields and ignore unknown fields; do not use `DisallowUnknownFields`.
+2. **Use the new repository identity.** The repository and Go module are `github.com/Henry-Haley/goGTFO`; the former decision to retain `github.com/aaron-kidwell/goLoL` no longer applies.
+3. **Use Go 1.26.5.** The `go.mod` directive and CI toolchain must both specify Go 1.26.5.
+4. **Build the binary as `goGTFO`.** This matches the module name and `go install github.com/Henry-Haley/goGTFO@latest`; remove `.exe` from Linux documentation and build outputs.
+5. **Remove LOLDrivers completely.** No LOLDrivers model, endpoint, `.sys` discovery, hash/match logic, loaded-driver inspection, rendering, help, test, documentation, or `-driver` flag survives the conversion.
+6. **Use the official JSON API.** Do not scrape HTML and do not parse the source YAML repository.
+7. **Fetch live on each run.** Match the original application's always-current behavior; add caching only after a real offline requirement appears.
+8. **Use PATH discovery by default.** It is fast, predictable, and matches executables the current shell can invoke.
+9. **Do not recursively scan `/`.** Off-PATH SUID/capability discovery is a later opt-in feature, not part of the initial implementation.
+10. **Do not automatically inspect program versions.** Version commands are inconsistent and may have side effects. Preserve version text and downgrade applicability to `unknown`.
+11. **Do not prompt for sudo.** Optional sudo checks use `sudo -n` and have a global timeout.
+12. **Do not parse catalog snippets.** Shell syntax is too varied to safely derive executable arguments or prerequisites.
+13. **Do not rewrite alias commands.** Display the official target command and clearly identify the alias chain.
+14. **Use no new library for capability inspection.** Use `golang.org/x/sys/unix`, which is already in `go.mod`.
+15. **Use a synthetic test fixture.** Do not commit a snapshot of the GPL-licensed live API.
+16. **Unknown API fields remain forward-compatible.** Decode required fields and ignore unknown fields; do not use `DisallowUnknownFields`.
+
+### Build and installation identity
+
+```bash
+go install github.com/Henry-Haley/goGTFO@latest
+git clone https://github.com/Henry-Haley/goGTFO.git
+cd goGTFO
+go build -o goGTFO .
+```
 
 ## Official data sources
 
@@ -753,7 +771,7 @@ Do not split output, flags, models, and helpers into additional packages unless 
 ### Tasks
 
 - [ ] Run `git status --short --branch` and record any pre-existing changes.
-- [ ] Confirm an installed Go toolchain satisfies the `go.mod` directive.
+- [ ] Run `where.exe go` and `go version`; record the selected executable path and confirm it reports exactly `go version go1.26.5 windows/amd64` for this Phase 0 baseline.
 - [ ] Run the committed Windows executable with `-plain -h` only to capture the current CLI reference if needed.
 - [ ] Record that the current source has no runnable tests.
 - [ ] Confirm the current official API responds and inspect its top-level keys without committing the response.
@@ -769,9 +787,10 @@ curl -fsSL https://gtfobins.org/api.json | head -c 80
 
 ### Acceptance gate
 
-- The implementation environment has a usable Go toolchain.
+- The implementation environment uses Go 1.26.5, matching `go.mod` exactly.
 - Repository changes are understood before edits begin.
 - No live GTFOBins data has been committed.
+- No command obtained from GTFOBins has been executed.
 
 ## Phase 1: Remove Windows-only and dead code
 
@@ -782,10 +801,16 @@ curl -fsSL https://gtfobins.org/api.json | head -c 80
 - [ ] Delete `enableVirtualTerminal` and its call sites.
 - [ ] Delete the unused `internal/signverify` directory.
 - [ ] Temporarily retain `internal/privileges` and `internal/mitre` because the existing orchestration still calls them; delete them atomically when Phase 8 replaces those callers.
+- [ ] Delete the LOLDrivers models `lolDriverSample`, `lolDriverCommand`, `lolDriverEntry`, `localDriver`, and `driverMatch`.
+- [ ] Delete `fetchLOLDriversCatalog` and the `https://www.loldrivers.io/api/drivers.json` endpoint.
+- [ ] Delete `.sys` discovery and hashing through `driverSearchRoots`, `hashFileSHA256`, `collectLocalDrivers`, and `findVulnerableDrivers`, then remove the now-unused `crypto/sha256` import.
+- [ ] Delete loaded-driver inspection through `normalizeDriverName`, `loadedDriverNames`, and `annotateLoadedState`, including every `sc.exe` and `driverquery` child-process path.
+- [ ] Delete `runDriverMode`, `printDriverResults`, `statusDisplay`, `boolDisplay`, `firstNonEmpty`, `firstSampleDescription`, and `firstCommand` when they have no non-driver callers.
+- [ ] Delete `driverFlag`, `-driver` validation and dispatch, and all `-driver` help text. Do not replace the flag.
 - [ ] Delete the tracked `goLoL.exe`.
-- [ ] Add `/golol` and `/golol.exe` to `.gitignore`.
+- [ ] Add `/goGTFO` and `/goGTFO.exe` to `.gitignore`.
 - [ ] Remove the stale screenshot or leave it only until the README phase if temporary broken documentation would hinder review.
-- [ ] Keep the module path unchanged.
+- [ ] Confirm the module path remains `github.com/Henry-Haley/goGTFO`; no `github.com/aaron-kidwell/goLoL` source import may remain.
 - [ ] Keep `golang.org/x/sys`; it will be used through `x/sys/unix`.
 
 ### Verification
@@ -794,13 +819,14 @@ curl -fsSL https://gtfobins.org/api.json | head -c 80
 gofmt -w .
 go test ./...
 go vet ./...
-go build -o golol .
+go build -o goGTFO .
 ```
 
 ### Acceptance gate
 
 - Windows console symbols no longer prevent Linux compilation.
 - Linux compilation succeeds through the existing non-Windows privilege stub, even though the old LOLBAS behavior is still temporarily present and must not be treated as functional Linux output.
+- No LOLDrivers endpoint, model, `.sys` scan, hash/match path, loaded-driver inspection, driver renderer, or `-driver` flag remains.
 - No caller is left referencing a package deleted in this phase.
 
 ## Phase 2: Add the synthetic catalog fixture and remote models
@@ -931,7 +957,7 @@ go vet ./...
 ```bash
 go test ./...
 go vet ./...
-go build -o golol .
+go build -o goGTFO .
 ```
 
 ### Acceptance gate
@@ -1029,8 +1055,8 @@ go vet ./...
 gofmt -w .
 go test ./...
 go vet ./...
-go build -trimpath -ldflags="-s -w" -o golol .
-./golol -plain -h
+go build -trimpath -ldflags="-s -w" -o goGTFO .
+./goGTFO -plain -h
 ```
 
 ### Acceptance gate
@@ -1051,14 +1077,14 @@ go build -trimpath -ldflags="-s -w" -o golol .
 - [ ] Print operational errors to stderr.
 - [ ] Avoid partial colored loader artifacts after a failure.
 - [ ] Ensure `-plain` contains no ESC bytes or Unicode borders.
-- [ ] Test invalid sort, exact search, case-insensitive search, ambiguity, absent catalog name, absent PATH binary, `-all`, and hidden-state summaries.
+- [ ] Test invalid sort, exact search, case-insensitive search, ambiguity, absent catalog name, absent PATH binary, `-all`, hidden-state summaries, and rejection of the removed `-driver` flag.
 
 ### Verification
 
 ```bash
 go test ./...
 go vet ./...
-./golol -plain -h
+./goGTFO -plain -h
 ```
 
 ### Acceptance gate
@@ -1078,10 +1104,10 @@ go vet ./...
 - [ ] Document `nosuid`, `noexec`, `NoNewPrivs`, and capability bounding-set handling.
 - [ ] Explain why sudo remains potential/unknown.
 - [ ] Document every flag and exit behavior.
-- [ ] Provide Linux build and install examples using `golol`.
+- [ ] Provide build and install examples using `github.com/Henry-Haley/goGTFO`, the `goGTFO` repository directory, and the `goGTFO` binary.
 - [ ] Attribute GTFOBins and link its project and source.
 - [ ] Note that live network access is required.
-- [ ] Remove Windows installation, `.exe`, SYSTEM, Administrators, and LOLBAS examples.
+- [ ] Remove Windows installation, `.exe`, SYSTEM, Administrators, LOLBAS, LOLDrivers, `.sys`, and `-driver` examples, including the old LOLDrivers endpoint and local-driver-scan descriptions.
 - [ ] Remove the stale screenshot; add a Linux screenshot only if it can be generated from harmless output.
 - [ ] Preserve the authorized-use disclaimer.
 
@@ -1089,7 +1115,7 @@ go vet ./...
 
 Add one small GitHub Actions workflow that:
 
-- [ ] Uses the Go version declared by `go.mod`.
+- [ ] Uses Go 1.26.5 exactly, matching `go.mod`.
 - [ ] Runs `go test ./...`.
 - [ ] Runs `go vet ./...`.
 - [ ] Builds Linux amd64.
@@ -1099,7 +1125,8 @@ Add one small GitHub Actions workflow that:
 
 ### Cleanup tasks
 
-- [ ] Run `rg -n -i 'lolbas|windows|administrator|system32|\.exe|windir|programfiles|wintrust|authenticode'` and inspect every remaining match.
+- [ ] Run `rg -n -i 'lolbas|loldriver|windows|administrator|system32|\.exe|\.sys|windir|programfiles|wintrust|authenticode|driverquery|sc\.exe'` and inspect every remaining match.
+- [ ] Run `rg -n 'github\.com/aaron-kidwell/goLoL|aaron-kidwell/goLoL'` and require no matches.
 - [ ] Run `rg -n 'os/exec|exec\.Command|CommandContext'` and confirm every child process is the planned non-interactive sudo probe or test fake.
 - [ ] Confirm no remote code path reaches command execution.
 - [ ] Confirm `.gitignore` covers local binaries.
@@ -1112,8 +1139,8 @@ Add one small GitHub Actions workflow that:
 gofmt -w .
 go test ./...
 go vet ./...
-GOOS=linux GOARCH=amd64 go build -trimpath -o golol-linux-amd64 .
-GOOS=linux GOARCH=arm64 go build -trimpath -o golol-linux-arm64 .
+GOOS=linux GOARCH=amd64 go build -trimpath -o goGTFO-linux-amd64 .
+GOOS=linux GOARCH=arm64 go build -trimpath -o goGTFO-linux-arm64 .
 git diff --check
 git status --short
 ```
@@ -1122,7 +1149,7 @@ git status --short
 
 - CI passes without live network access.
 - Documentation describes actual behavior and limitations.
-- No stale Windows implementation or build artifact remains.
+- No stale Windows, LOLBAS, or LOLDrivers implementation, documentation, endpoint, local scan, flag, or build artifact remains.
 - The final diff contains no speculative framework.
 
 ## Required test matrix
@@ -1194,6 +1221,7 @@ git status --short
 
 - [ ] Help performs no network work.
 - [ ] Invalid flags perform no network work.
+- [ ] The removed `-driver` flag is absent from help and rejected as an unknown flag without network work.
 - [ ] Binary, context, and ATT&CK sorting.
 - [ ] Deterministic map ordering.
 - [ ] Exact and case-insensitive search.
@@ -1214,12 +1242,12 @@ Run these only after all automated tests pass. Do not execute any displayed GTFO
 ### Ubuntu or Debian-family host
 
 ```bash
-./golol -plain -h
-./golol -plain -s bash
-./golol -plain -s definitely-not-a-real-catalog-entry
-./golol -plain -sort context
-./golol -plain -sort attack
-./golol -plain -all -s bash
+./goGTFO -plain -h
+./goGTFO -plain -s bash
+./goGTFO -plain -s definitely-not-a-real-catalog-entry
+./goGTFO -plain -sort context
+./goGTFO -plain -sort attack
+./goGTFO -plain -all -s bash
 ```
 
 Confirm:
@@ -1239,7 +1267,7 @@ Repeat the harmless listing commands above and compare only structural behavior.
 Run only on a disposable or authorized test host where policy-list checks may be logged:
 
 ```bash
-./golol -plain -check-sudo -s bash
+./goGTFO -plain -check-sudo -s bash
 ```
 
 Confirm:
@@ -1254,7 +1282,7 @@ The conversion is complete only when all of these are true:
 
 ### Functional
 
-- [ ] The project builds as a Linux binary named `golol`.
+- [ ] The project builds as a Linux binary named `goGTFO`.
 - [ ] It fetches and parses the live official GTFOBins API.
 - [ ] It detects exact catalog names in PATH.
 - [ ] It resolves aliases, inheritance, context overrides, and companions.
@@ -1278,6 +1306,7 @@ The conversion is complete only when all of these are true:
 - [ ] Default operation never prompts for credentials.
 - [ ] Sudo probing is direct, non-interactive, cached, and time-bounded.
 - [ ] No recursive filesystem scan occurs.
+- [ ] No LOLDrivers endpoint or local driver scan exists in the completed application.
 
 ### Quality
 
@@ -1316,7 +1345,7 @@ Do not implement these during the conversion. Revisit only when the stated trigg
 | JSON output | A concrete automation consumer and schema requirements exist. |
 | Version probing | Safe per-executable version strategies and false-positive policy are defined. |
 | Direct sudoers interpretation | A reliable library/API and precise authorization semantics are available. |
-| Windows/LOLBAS mode | Maintaining one binary for both platforms becomes a real product requirement. |
+| Windows/LOLBAS/LOLDrivers mode | Maintaining one binary for both platforms becomes a real product requirement. |
 | macOS/BSD | A catalog and platform-specific privilege model are selected. |
 | Release automation | Manual tagged builds become a recurring burden. |
 | Additional packages | Standard library plus `x/sys/unix` is proven insufficient. |
