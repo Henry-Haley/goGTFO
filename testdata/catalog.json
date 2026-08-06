@@ -1,0 +1,131 @@
+{
+  "functions": {
+    "command": {
+      "label": "Fixture command",
+      "description": "Runs a harmless fixture command.",
+      "mitre": ["T0001", "T0002"],
+      "extra": {
+        "fixture-listener": {
+          "comment": "Synthetic shared companion.",
+          "code": "echo fixture"
+        }
+      },
+      "future_function_field": "ignored"
+    },
+    "inherit": {
+      "label": "Fixture inheritance",
+      "description": "References another synthetic executable.",
+      "mitre": []
+    },
+    "fixture-unknown": {
+      "label": "Unknown fixture function",
+      "description": "Exercises forward-compatible function decoding.",
+      "mitre": ["T0003"]
+    }
+  },
+  "contexts": {
+    "unprivileged": {
+      "label": "Unprivileged",
+      "description": "Synthetic unprivileged context."
+    },
+    "sudo": {
+      "label": "Sudo",
+      "description": "Synthetic sudo context."
+    },
+    "suid": {
+      "label": "SUID",
+      "description": "Synthetic SUID context."
+    },
+    "capabilities": {
+      "label": "Capabilities",
+      "description": "Synthetic capability context."
+    },
+    "fixture-context": {
+      "label": "Unknown fixture context",
+      "description": "Exercises forward-compatible context decoding."
+    }
+  },
+  "executables": {
+    "fixture-tool": {
+      "comment": "Synthetic executable used only by tests.",
+      "functions": {
+        "command": [
+          {
+            "code": "fixture-command --example",
+            "comment": "Harmless placeholder example.",
+            "version": "fixture-version <= 1",
+            "contexts": {
+              "unprivileged": null,
+              "sudo": {
+                "code": "fixture-command --sudo-example",
+                "comment": "Synthetic context-specific override."
+              },
+              "suid": {
+                "shell": "fixture-shell"
+              },
+              "capabilities": {
+                "list": ["CAP_FIXTURE"]
+              },
+              "fixture-context": {
+                "comment": "Synthetic unknown context."
+              }
+            },
+            "blind": false,
+            "tty": true,
+            "binary": false,
+            "listener": "fixture-listener",
+            "connector": {
+              "comment": "Synthetic inline companion.",
+              "code": "echo fixture"
+            },
+            "future_example_field": true
+          }
+        ],
+        "fixture-unknown": [
+          {
+            "code": "echo fixture",
+            "contexts": {
+              "unprivileged": null
+            }
+          }
+        ]
+      },
+      "future_executable_field": 1
+    },
+    "fixture-alias": {
+      "alias": "fixture-tool"
+    },
+    "fixture-alias-two": {
+      "alias": "fixture-alias"
+    },
+    "fixture-parent": {
+      "functions": {
+        "inherit": [
+          {
+            "code": "fixture-command --example",
+            "from": "fixture-tool",
+            "contexts": {
+              "unprivileged": null
+            }
+          }
+        ]
+      }
+    },
+    "fixture-grandparent": {
+      "functions": {
+        "inherit": [
+          {
+            "code": "fixture-command --example",
+            "from": "fixture-parent",
+            "contexts": {
+              "unprivileged": null
+            }
+          }
+        ]
+      }
+    }
+  },
+  "future_top_level_field": {
+    "ignored": true
+  }
+}
