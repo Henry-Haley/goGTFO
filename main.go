@@ -177,7 +177,7 @@ const (
 	colorMagenta = "\033[95m"
 )
 
-var plainMode bool
+var plainMode, checkSudo bool
 
 type sortMode string
 
@@ -347,6 +347,7 @@ Usage:
 Flags:
   -h, -help          Show this help
   -plain             ASCII-only output for telnet/reverse shells
+  -check-sudo        Check sudo policy non-interactively; checks may be logged
   -s, -search string Search for one binary (e.g. certutil or certutil.exe)
   -sort string       Sort results (default "binary")
                        binary     Group by binary name (A-Z)
@@ -377,6 +378,7 @@ when running as SYSTEM.
 %sFlags:%s
   -h, -help          Show this help
   -plain             ASCII-only output for telnet/reverse shells
+  -check-sudo        Check sudo policy non-interactively; checks may be logged
   -s, -search string Search for one binary (e.g. certutil or certutil.exe)
   -sort string       Sort results (default "binary")
                        binary     Group by binary name (A-Z)
@@ -745,6 +747,7 @@ func main() {
 	help := flag.Bool("h", false, "show help")
 	helpLong := flag.Bool("help", false, "show help")
 	plainFlag := flag.Bool("plain", false, "ASCII-only output for telnet/reverse shells")
+	flag.BoolVar(&checkSudo, "check-sudo", false, "check sudo policy non-interactively; checks may be logged")
 	var searchQuery string
 	flag.StringVar(&searchQuery, "s", "", "search for a specific binary by name")
 	flag.StringVar(&searchQuery, "search", "", "search for a specific binary by name")

@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -40,12 +42,44 @@ const (
 	vfsCapabilityEffective     uint32 = 0x00000001
 	vfsCapabilityRevision2Size        = 20
 	vfsCapabilityRevision3Size        = 24
+	sudoProbeBudget                   = 20 * time.Second
 )
 
 type applicabilityResult struct {
 	State    applicabilityState
 	Evidence []string
 }
+
+type sudoProbeStatus uint8
+
+const (
+	sudoProbeNotAttempted sudoProbeStatus = iota
+	sudoProbeRecognized
+	sudoProbeNonzero
+	sudoProbeExecutionError
+	sudoProbeBudgetExhausted
+)
+
+type sudoProbeResult struct {
+	Status sudoProbeStatus
+	Err    error
+}
+
+type sudoProbeBatch struct {
+	SudoPath  string
+	LookupErr error
+	Results   map[string]sudoProbeResult
+}
+
+type sudoEvaluationInput struct {
+	EffectiveUID   int
+	SudoPresent    bool
+	ProbeRequested bool
+	Probe          sudoProbeResult
+	Version        string
+}
+
+type sudoRunner func(context.Context, string, string) error
 
 type suidEvaluationInput struct {
 	FileInspected   bool
@@ -651,4 +685,112 @@ func evaluateCapabilities(input capabilityEvaluationInput) applicabilityResult {
 	}
 
 	return applicabilityResult{State: composeApplicability(states...), Evidence: evidence}
+}
+
+func evaluateSudo(input sudoEvaluationInput) applicabilityResult {
+	states := []applicabilityState{stateConfirmed}
+	var evidence []string
+
+	switch {
+	case !input.SudoPresent:
+		states = append(states, stateUnavailable)
+		evidence = append(evidence, "sudo is not safely available in PATH")
+	case input.EffectiveUID == 0:
+		evidence = append(evidence, "effective UID is 0; sudo may be unnecessary")
+	case !input.ProbeRequested:
+		states = append(states, stateUnknown)
+		evidence = append(evidence, "sudo is available, but policy was not checked; use -check-sudo for path-level evidence")
+	default:
+		switch input.Probe.Status {
+		case sudoProbeRecognized:
+			states = append(states, statePotential)
+			evidence = append(evidence,
+				"sudo policy recognized the canonical executable path",
+				"path-level sudo evidence does not prove the full GTFOBins command line is authorized",
+			)
+		case sudoProbeNonzero:
+			states = append(states, stateUnknown)
+			evidence = append(evidence, "sudo policy probe returned a nonzero result; authorization could not be determined")
+		case sudoProbeExecutionError:
+			states = append(states, stateUnknown)
+			message := "sudo policy probe could not be executed"
+			if input.Probe.Err != nil {
+				message += ": " + input.Probe.Err.Error()
+			}
+			evidence = append(evidence, message)
+		case sudoProbeBudgetExhausted:
+			states = append(states, stateUnknown)
+			evidence = append(evidence, "global sudo probe budget expired before this path could be checked")
+		default:
+			states = append(states, stateUnknown)
+			evidence = append(evidence, "sudo policy probe was requested but no result is available")
+		}
+	}
+
+	if input.Version != "" {
+		states = append(states, stateUnknown)
+		evidence = append(evidence, "version restriction was not verified: "+input.Version)
+	}
+
+	return applicabilityResult{State: composeApplicability(states...), Evidence: evidence}
+}
+
+func probeSudoPolicies(parent context.Context, requested bool, discoveries []executableDiscovery, runner sudoRunner) sudoProbeBatch {
+	if !requested {
+		return sudoProbeBatch{}
+	}
+
+	sudoPath, err := exec.LookPath("sudo")
+	if err != nil {
+		if errors.Is(err, exec.ErrDot) {
+			err = fmt.Errorf("locate sudo: unsafe current-directory PATH result: %w", err)
+		} else {
+			err = fmt.Errorf("locate sudo: %w", err)
+		}
+		return sudoProbeBatch{LookupErr: err}
+	}
+
+	ctx, cancel := context.WithTimeout(parent, sudoProbeBudget)
+	defer cancel()
+	batch := sudoProbeBatch{
+		SudoPath: sudoPath,
+		Results:  make(map[string]sudoProbeResult),
+	}
+	for _, discovery := range discoveries {
+		path := discovery.CanonicalPath
+		if path == "" {
+			continue
+		}
+		if _, cached := batch.Results[path]; cached {
+			continue
+		}
+		if ctx.Err() != nil {
+			batch.Results[path] = sudoProbeResult{Status: sudoProbeBudgetExhausted, Err: ctx.Err()}
+			continue
+		}
+
+		err := runner(ctx, sudoPath, path)
+		switch {
+		case err == nil:
+			batch.Results[path] = sudoProbeResult{Status: sudoProbeRecognized}
+		case ctx.Err() != nil:
+			batch.Results[path] = sudoProbeResult{Status: sudoProbeBudgetExhausted, Err: ctx.Err()}
+		default:
+			var exitError *exec.ExitError
+			if errors.As(err, &exitError) {
+				batch.Results[path] = sudoProbeResult{Status: sudoProbeNonzero}
+			} else {
+				batch.Results[path] = sudoProbeResult{Status: sudoProbeExecutionError, Err: err}
+			}
+		}
+	}
+	return batch
+}
+
+func newSudoCommand(ctx context.Context, sudoPath, canonicalPath string) *exec.Cmd {
+	return exec.CommandContext(ctx, sudoPath, "-n", "-l", canonicalPath)
+}
+
+func runSudoProbe(ctx context.Context, sudoPath, canonicalPath string) error {
+	return newSudoCommand(ctx, sudoPath, canonicalPath).Run()
 }

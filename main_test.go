@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -1195,6 +1196,299 @@ func TestEvaluateCapabilities(t *testing.T) {
 				t.Fatalf("evidence order changed: first %v, second %v", got.Evidence, again.Evidence)
 			}
 		})
+	}
+}
+
+func validSudoEvaluationInput() sudoEvaluationInput {
+	return sudoEvaluationInput{
+		EffectiveUID:   1000,
+		SudoPresent:    true,
+		ProbeRequested: true,
+		Probe:          sudoProbeResult{Status: sudoProbeRecognized},
+	}
+}
+
+func TestEvaluateSudo(t *testing.T) {
+	tests := []struct {
+		name     string
+		change   func(*sudoEvaluationInput)
+		want     applicabilityState
+		evidence string
+	}{
+		{"sudo absent", func(input *sudoEvaluationInput) { input.SudoPresent = false }, stateUnavailable, "not safely available"},
+		{"effective UID zero", func(input *sudoEvaluationInput) { input.EffectiveUID = 0 }, stateConfirmed, "effective UID is 0"},
+		{"effective UID zero with version", func(input *sudoEvaluationInput) { input.EffectiveUID = 0; input.Version = "fixture <= 1" }, stateUnknown, "version restriction was not verified"},
+		{"non-root without probe", func(input *sudoEvaluationInput) { input.ProbeRequested = false }, stateUnknown, "use -check-sudo"},
+		{"successful probe", func(*sudoEvaluationInput) {}, statePotential, "does not prove the full GTFOBins command line"},
+		{"successful probe with version", func(input *sudoEvaluationInput) { input.Version = "fixture <= 1" }, stateUnknown, "version restriction was not verified"},
+		{"nonzero probe", func(input *sudoEvaluationInput) { input.Probe.Status = sudoProbeNonzero }, stateUnknown, "nonzero result"},
+		{"execution error", func(input *sudoEvaluationInput) {
+			input.Probe = sudoProbeResult{Status: sudoProbeExecutionError, Err: errors.New("fixture failure")}
+		}, stateUnknown, "fixture failure"},
+		{"budget exhausted", func(input *sudoEvaluationInput) { input.Probe.Status = sudoProbeBudgetExhausted }, stateUnknown, "global sudo probe budget expired"},
+		{"probe result missing", func(input *sudoEvaluationInput) { input.Probe.Status = sudoProbeNotAttempted }, stateUnknown, "no result is available"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := validSudoEvaluationInput()
+			tt.change(&input)
+			got := evaluateSudo(input)
+			if got.State != tt.want || !warningContains(got.Evidence, tt.evidence) {
+				t.Fatalf("evaluateSudo() = %#v, want %q with evidence containing %q", got, tt.want, tt.evidence)
+			}
+			if tt.want != stateConfirmed && len(got.Evidence) == 0 {
+				t.Fatal("non-confirmed sudo result has no evidence")
+			}
+			if input.EffectiveUID != 0 && input.Probe.Status == sudoProbeRecognized && got.State == stateConfirmed {
+				t.Fatal("successful sudo path probe was classified as confirmed")
+			}
+			if again := evaluateSudo(input); !reflect.DeepEqual(got, again) {
+				t.Fatalf("sudo evidence order changed: first %v, second %v", got.Evidence, again.Evidence)
+			}
+		})
+	}
+}
+
+func TestSudoEvidenceOrder(t *testing.T) {
+	input := validSudoEvaluationInput()
+	input.Version = "fixture <= 1"
+	want := []string{
+		"sudo policy recognized the canonical executable path",
+		"path-level sudo evidence does not prove the full GTFOBins command line is authorized",
+		"version restriction was not verified: fixture <= 1",
+	}
+	if got := evaluateSudo(input); got.State != stateUnknown || !reflect.DeepEqual(got.Evidence, want) {
+		t.Fatalf("evaluateSudo() = %#v, want unknown with %v", got, want)
+	}
+}
+
+func TestNewSudoCommandIsNonInteractiveAndCanonical(t *testing.T) {
+	sudoPath := "/fixture/sudo"
+	canonicalPath := "/canonical/Case Tool"
+	command := newSudoCommand(context.Background(), sudoPath, canonicalPath)
+	want := []string{sudoPath, "-n", "-l", canonicalPath}
+	if command.Path != sudoPath || !reflect.DeepEqual(command.Args, want) {
+		t.Fatalf("sudo command path/args = %q/%v, want %q/%v", command.Path, command.Args, sudoPath, want)
+	}
+	if command.Stdin != nil || command.Stdout != nil || command.Stderr != nil {
+		t.Fatal("sudo command unexpectedly attached process I/O")
+	}
+}
+
+func fakeSudoPath(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := writeTestExecutable(t, dir, "sudo")
+	t.Setenv("PATH", dir)
+	return path
+}
+
+func TestProbeSudoPoliciesRunnerOutcomes(t *testing.T) {
+	tests := []struct {
+		name   string
+		err    error
+		status sudoProbeStatus
+	}{
+		{"success", nil, sudoProbeRecognized},
+		{"nonzero", &exec.ExitError{}, sudoProbeNonzero},
+		{"execution failure", errors.New("fixture failure"), sudoProbeExecutionError},
+		{"runner context cancellation", context.Canceled, sudoProbeExecutionError},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sudoPath := fakeSudoPath(t)
+			canonicalPath := "/canonical/Fixture Tool"
+			calls := 0
+			batch := probeSudoPolicies(context.Background(), true, []executableDiscovery{{CanonicalPath: canonicalPath}}, func(_ context.Context, gotSudo, gotCanonical string) error {
+				calls++
+				if gotSudo != sudoPath || gotCanonical != canonicalPath {
+					t.Fatalf("runner arguments = %q, %q; want %q, %q", gotSudo, gotCanonical, sudoPath, canonicalPath)
+				}
+				return tt.err
+			})
+			if calls != 1 || batch.SudoPath != sudoPath || batch.LookupErr != nil || batch.Results[canonicalPath].Status != tt.status {
+				t.Fatalf("probe batch = %#v, calls = %d", batch, calls)
+			}
+		})
+	}
+}
+
+func TestProbeSudoPoliciesUsesOnlyCanonicalPath(t *testing.T) {
+	fakeSudoPath(t)
+	invocablePath := "/invocable/symlink"
+	canonicalPath := "/canonical/Exact Case --fixture"
+	catalogCommand := "fixture-command | must-never-run"
+	discoveries := []executableDiscovery{{InvocablePath: invocablePath, CanonicalPath: canonicalPath}}
+	var received string
+	probeSudoPolicies(context.Background(), true, discoveries, func(_ context.Context, _, path string) error {
+		received = path
+		return nil
+	})
+	if received != canonicalPath || received == invocablePath || received == catalogCommand {
+		t.Fatalf("runner received %q, want canonical path %q only", received, canonicalPath)
+	}
+}
+
+func TestProbeSudoPoliciesCachesCanonicalPaths(t *testing.T) {
+	fakeSudoPath(t)
+	discoveries := []executableDiscovery{
+		{CatalogName: "catalog-a", InvocablePath: "/alias/a", CanonicalPath: "/canonical/shared"},
+		{CatalogName: "catalog-b", InvocablePath: "/alias/b", CanonicalPath: "/canonical/shared"},
+		{CatalogName: "catalog-c", CanonicalPath: "/canonical/other"},
+		{CatalogName: "missing-canonical"},
+	}
+	before := slices.Clone(discoveries)
+	calls := make(map[string]int)
+	runner := func(_ context.Context, _, path string) error {
+		calls[path]++
+		return nil
+	}
+	first := probeSudoPolicies(context.Background(), true, discoveries, runner)
+	if calls["/canonical/shared"] != 1 || calls["/canonical/other"] != 1 || len(calls) != 2 || len(first.Results) != 2 {
+		t.Fatalf("cache calls/results = %v/%v", calls, first.Results)
+	}
+	if first.Results["/canonical/shared"].Status != sudoProbeRecognized || first.Results["/canonical/other"].Status != sudoProbeRecognized {
+		t.Fatalf("cached results = %#v", first.Results)
+	}
+	if _, ok := first.Results[""]; ok {
+		t.Fatal("empty canonical path was probed")
+	}
+	if !reflect.DeepEqual(discoveries, before) || len(discoveries) != 4 {
+		t.Fatal("probe cache deduplicated or modified catalog discoveries")
+	}
+
+	secondCalls := 0
+	second := probeSudoPolicies(context.Background(), true, discoveries, func(context.Context, string, string) error {
+		secondCalls++
+		return nil
+	})
+	if secondCalls != 2 || !reflect.DeepEqual(first.Results, second.Results) {
+		t.Fatalf("repeated cache is not deterministic: calls %d, first %v, second %v", secondCalls, first.Results, second.Results)
+	}
+}
+
+func TestProbeSudoPoliciesGlobalBudget(t *testing.T) {
+	t.Run("already cancelled", func(t *testing.T) {
+		fakeSudoPath(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		discoveries := []executableDiscovery{
+			{CanonicalPath: "/canonical/one"},
+			{CanonicalPath: "/canonical/two"},
+		}
+		calls := 0
+		batch := probeSudoPolicies(ctx, true, discoveries, func(context.Context, string, string) error {
+			calls++
+			return nil
+		})
+		if calls != 0 {
+			t.Fatalf("runner called %d times after budget expiration", calls)
+		}
+		for _, discovery := range discoveries {
+			result := batch.Results[discovery.CanonicalPath]
+			if result.Status != sudoProbeBudgetExhausted {
+				t.Fatalf("result for %q = %#v, want budget exhausted", discovery.CanonicalPath, result)
+			}
+			evaluated := evaluateSudo(sudoEvaluationInput{
+				EffectiveUID:   1000,
+				SudoPresent:    true,
+				ProbeRequested: true,
+				Probe:          result,
+			})
+			if evaluated.State != stateUnknown || !warningContains(evaluated.Evidence, "global sudo probe budget expired") {
+				t.Fatalf("budget evaluation = %#v", evaluated)
+			}
+		}
+	})
+
+	t.Run("expiration preserves completed cache and stops new probes", func(t *testing.T) {
+		fakeSudoPath(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		discoveries := []executableDiscovery{
+			{CanonicalPath: "/canonical/completed"},
+			{CanonicalPath: "/canonical/unstarted"},
+			{CanonicalPath: "/canonical/completed"},
+			{CanonicalPath: "/canonical/also-unstarted"},
+		}
+		calls := 0
+		batch := probeSudoPolicies(ctx, true, discoveries, func(context.Context, string, string) error {
+			calls++
+			cancel()
+			return nil
+		})
+		if calls != 1 {
+			t.Fatalf("runner called %d times, want 1", calls)
+		}
+		if got := batch.Results["/canonical/completed"].Status; got != sudoProbeRecognized {
+			t.Fatalf("completed cached result = %v, want recognized", got)
+		}
+		for _, path := range []string{"/canonical/unstarted", "/canonical/also-unstarted"} {
+			if got := batch.Results[path].Status; got != sudoProbeBudgetExhausted {
+				t.Fatalf("unstarted result for %q = %v, want budget exhausted", path, got)
+			}
+		}
+	})
+}
+
+func TestProbeSudoPoliciesDisabledDoesNothing(t *testing.T) {
+	dir := t.TempDir()
+	writeTestExecutable(t, dir, "sudo")
+	t.Chdir(dir)
+	t.Setenv("PATH", ".")
+	calls := 0
+	discoveries := []executableDiscovery{
+		{CatalogName: "sudo-fixture-a", CanonicalPath: "/canonical/fixture-a"},
+		{CatalogName: "sudo-fixture-b", CanonicalPath: "/canonical/fixture-b"},
+	}
+	batch := probeSudoPolicies(context.Background(), false, discoveries, func(context.Context, string, string) error {
+		calls++
+		return nil
+	})
+	if calls != 0 || batch.SudoPath != "" || batch.LookupErr != nil || len(batch.Results) != 0 {
+		t.Fatalf("disabled probe did work: calls=%d batch=%#v", calls, batch)
+	}
+}
+
+func TestProbeSudoPoliciesLookupFailures(t *testing.T) {
+	t.Run("absent", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		calls := 0
+		batch := probeSudoPolicies(context.Background(), true, []executableDiscovery{{CanonicalPath: "/canonical/fixture"}}, func(context.Context, string, string) error {
+			calls++
+			return nil
+		})
+		if calls != 0 || batch.SudoPath != "" || batch.LookupErr == nil {
+			t.Fatalf("absent sudo result: calls=%d batch=%#v", calls, batch)
+		}
+	})
+
+	t.Run("current directory rejected", func(t *testing.T) {
+		dir := t.TempDir()
+		writeTestExecutable(t, dir, "sudo")
+		t.Chdir(dir)
+		t.Setenv("PATH", ".")
+		calls := 0
+		batch := probeSudoPolicies(context.Background(), true, []executableDiscovery{{CanonicalPath: "/canonical/fixture"}}, func(context.Context, string, string) error {
+			calls++
+			return nil
+		})
+		if calls != 0 || batch.SudoPath != "" || !errors.Is(batch.LookupErr, exec.ErrDot) {
+			t.Fatalf("unsafe sudo result: calls=%d batch=%#v", calls, batch)
+		}
+	})
+}
+
+func TestHelpDocumentsCheckSudo(t *testing.T) {
+	previous := plainMode
+	defer func() { plainMode = previous }()
+	for _, plain := range []bool{true, false} {
+		plainMode = plain
+		output := captureProcessOutput(t, printHelp)
+		if !strings.Contains(output, "-check-sudo") || !strings.Contains(output, "Check sudo policy non-interactively; checks may be logged") {
+			t.Fatalf("plain=%v help does not document safe sudo probing: %q", plain, output)
+		}
 	}
 }
 
