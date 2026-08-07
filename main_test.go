@@ -4,16 +4,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"unicode"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestDecodeCatalogFixture(t *testing.T) {
@@ -466,6 +470,345 @@ func TestResolutionDeduplicationUsesExplicitIdentity(t *testing.T) {
 			t.Fatalf("inheritance chain %d = %v, want %v", index, root.Techniques[index].InheritanceChain, want)
 		}
 	}
+}
+
+func TestParseProcStatus(t *testing.T) {
+	tests := []struct {
+		name         string
+		input        string
+		want         procStatus
+		wantWarnings bool
+	}{
+		{
+			name:         "NoNewPrivs zero",
+			input:        "NoNewPrivs:\t0\n",
+			want:         procStatus{NoNewPrivsKnown: true},
+			wantWarnings: true,
+		},
+		{
+			name:         "NoNewPrivs one",
+			input:        "NoNewPrivs:\t1\n",
+			want:         procStatus{NoNewPrivs: true, NoNewPrivsKnown: true},
+			wantWarnings: true,
+		},
+		{
+			name:         "valid CapBnd",
+			input:        "CapBnd:\t00000000a80425fb\n",
+			want:         procStatus{CapBnd: 0xa80425fb, CapBndKnown: true},
+			wantWarnings: true,
+		},
+		{
+			name:  "both valid",
+			input: "NoNewPrivs:\t0\nCapBnd:\t00000000a80425fb\n",
+			want:  procStatus{NoNewPrivsKnown: true, CapBnd: 0xa80425fb, CapBndKnown: true},
+		},
+		{
+			name:         "missing NoNewPrivs",
+			input:        "CapBnd:\t1\n",
+			want:         procStatus{CapBnd: 1, CapBndKnown: true},
+			wantWarnings: true,
+		},
+		{
+			name:         "missing CapBnd",
+			input:        "NoNewPrivs:\t1\n",
+			want:         procStatus{NoNewPrivs: true, NoNewPrivsKnown: true},
+			wantWarnings: true,
+		},
+		{
+			name:         "both missing",
+			input:        "Name:\tfixture\n",
+			want:         procStatus{},
+			wantWarnings: true,
+		},
+		{
+			name:         "malformed decimal",
+			input:        "NoNewPrivs:\tinvalid\nCapBnd:\t2\n",
+			want:         procStatus{CapBnd: 2, CapBndKnown: true},
+			wantWarnings: true,
+		},
+		{
+			name:         "NoNewPrivs outside boolean range",
+			input:        "NoNewPrivs:\t2\nCapBnd:\t3\n",
+			want:         procStatus{CapBnd: 3, CapBndKnown: true},
+			wantWarnings: true,
+		},
+		{
+			name:         "malformed hexadecimal",
+			input:        "NoNewPrivs:\t1\nCapBnd:\tnot-hex\n",
+			want:         procStatus{NoNewPrivs: true, NoNewPrivsKnown: true},
+			wantWarnings: true,
+		},
+		{
+			name:  "unrelated lines ignored",
+			input: "Name:\tfixture\nState:\tR\nNoNewPrivs:\t0\nCapBnd:\tf\nThreads:\t1\n",
+			want:  procStatus{NoNewPrivsKnown: true, CapBnd: 0xf, CapBndKnown: true},
+		},
+		{
+			name:  "arbitrary whitespace",
+			input: "  NoNewPrivs :   1  \n\tCapBnd:\t  000f \t\n",
+			want:  procStatus{NoNewPrivs: true, NoNewPrivsKnown: true, CapBnd: 0xf, CapBndKnown: true},
+		},
+		{
+			name:         "malformed field preserves other valid field",
+			input:        "NoNewPrivs:\tbad\nCapBnd:\tff\n",
+			want:         procStatus{CapBnd: 0xff, CapBndKnown: true},
+			wantWarnings: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, warnings := parseProcStatus(strings.NewReader(tt.input))
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("status = %#v, want %#v", got, tt.want)
+			}
+			if (len(warnings) != 0) != tt.wantWarnings {
+				t.Fatalf("warnings = %v, wantWarnings = %v", warnings, tt.wantWarnings)
+			}
+		})
+	}
+}
+
+func TestSearchCatalogName(t *testing.T) {
+	executables := map[string]executableDef{
+		"Tool":      {},
+		"tool":      {},
+		"Unique":    {},
+		"thing.exe": {},
+		"plain":     {},
+	}
+	tests := []struct {
+		name           string
+		query          string
+		wantName       string
+		wantCandidates []string
+		wantErr        error
+	}{
+		{"exact match", "Tool", "Tool", nil, nil},
+		{"exact match wins", "tool", "tool", nil, nil},
+		{"unique case-insensitive", "UNIQUE", "Unique", nil, nil},
+		{"ambiguous case-insensitive", "TOOL", "", []string{"Tool", "tool"}, errCatalogNameAmbiguous},
+		{"no match", "missing", "", nil, errCatalogNameNotFound},
+		{"directory prefix", "/usr/bin/Unique", "Unique", nil, nil},
+		{"no suffix insertion", "thing", "", nil, errCatalogNameNotFound},
+		{"suffix preserved", "thing.exe", "thing.exe", nil, nil},
+		{"no suffix stripping", "plain.exe", "", nil, errCatalogNameNotFound},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := searchCatalogName(executables, tt.query)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tt.wantErr)
+			}
+			if result.Name != tt.wantName || !reflect.DeepEqual(result.Candidates, tt.wantCandidates) {
+				t.Fatalf("result = %#v, want name %q candidates %v", result, tt.wantName, tt.wantCandidates)
+			}
+			if tt.query == "UNIQUE" && result.Name != "Unique" {
+				t.Fatalf("catalog capitalization was not preserved: %#v", result)
+			}
+		})
+	}
+}
+
+func TestDiscoverExecutables(t *testing.T) {
+	dir := t.TempDir()
+	directPath := writeTestExecutable(t, dir, "CaseTool")
+	targetPath := writeTestExecutable(t, dir, "shared-target")
+	aliasAPath := filepath.Join(dir, "AliasA")
+	aliasBPath := filepath.Join(dir, "AliasB")
+	if err := os.Symlink(targetPath, aliasAPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(targetPath, aliasBPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dir, "absent-target"), filepath.Join(dir, "Broken")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "Directory"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+
+	results := discoverExecutables(map[string]executableDef{
+		"Missing":   {},
+		"Directory": {},
+		"CaseTool":  {},
+		"Broken":    {},
+		"AliasB":    {},
+		"AliasA":    {},
+	})
+	wantOrder := []string{"AliasA", "AliasB", "Broken", "CaseTool", "Directory", "Missing"}
+	for index, name := range wantOrder {
+		if results[index].CatalogName != name {
+			t.Fatalf("discovery order = %#v, want %v", results, wantOrder)
+		}
+	}
+
+	direct := discoveryNamed(t, results, "CaseTool")
+	if !direct.Found || !direct.Executable || direct.InvocablePath != directPath || direct.CanonicalPath != directPath || direct.FileInfo == nil || direct.FileInfo.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("direct discovery = %#v", direct)
+	}
+	if direct.CatalogName != "CaseTool" || strings.Contains(direct.InvocablePath, "casetool") {
+		t.Fatalf("catalog/path case was changed: %#v", direct)
+	}
+
+	aliasA := discoveryNamed(t, results, "AliasA")
+	aliasB := discoveryNamed(t, results, "AliasB")
+	if aliasA.InvocablePath != aliasAPath || aliasB.InvocablePath != aliasBPath || aliasA.CanonicalPath != targetPath || aliasB.CanonicalPath != targetPath {
+		t.Fatalf("symlink discovery A=%#v B=%#v", aliasA, aliasB)
+	}
+	if aliasA.CatalogName == aliasB.CatalogName || len(results) != len(wantOrder) {
+		t.Fatal("distinct catalog names sharing one canonical target were deduplicated")
+	}
+
+	for _, name := range []string{"Broken", "Directory", "Missing"} {
+		value := discoveryNamed(t, results, name)
+		if value.Found || value.Warning == "" {
+			t.Fatalf("nonfatal discovery failure for %q = %#v", name, value)
+		}
+	}
+}
+
+func TestDiscoverExecutableRejectsErrDot(t *testing.T) {
+	dir := t.TempDir()
+	writeTestExecutable(t, dir, "RelativeTool")
+	t.Chdir(dir)
+	t.Setenv("PATH", ".")
+
+	result := discoverExecutable("RelativeTool")
+	if result.Found || !strings.Contains(result.Warning, "current directory") {
+		t.Fatalf("ErrDot result = %#v", result)
+	}
+}
+
+func TestCanonicalTargetFailuresAreNonfatal(t *testing.T) {
+	t.Run("stat failure", func(t *testing.T) {
+		result := inspectCanonicalExecutable(executableDiscovery{
+			CatalogName:   "missing",
+			Found:         true,
+			InvocablePath: "/fixture/missing",
+			CanonicalPath: filepath.Join(t.TempDir(), "missing"),
+		})
+		if result.Executable || !strings.Contains(result.Warning, "stat canonical target") {
+			t.Fatalf("stat failure = %#v", result)
+		}
+	})
+
+	t.Run("directory rejected", func(t *testing.T) {
+		dir := t.TempDir()
+		result := inspectCanonicalExecutable(executableDiscovery{
+			CatalogName:   "directory",
+			Found:         true,
+			InvocablePath: dir,
+			CanonicalPath: dir,
+		})
+		if result.Executable || !strings.Contains(result.Warning, "not a regular file") {
+			t.Fatalf("directory result = %#v", result)
+		}
+	})
+}
+
+func TestInterpretMountFlags(t *testing.T) {
+	tests := []struct {
+		name   string
+		flags  int64
+		noExec bool
+		noSUID bool
+	}{
+		{"neither", 0, false, false},
+		{"noexec", unix.ST_NOEXEC, true, false},
+		{"nosuid", unix.ST_NOSUID, false, true},
+		{"both", unix.ST_NOEXEC | unix.ST_NOSUID, true, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status := interpretMountFlags(tt.flags)
+			if !status.Known || status.NoExec != tt.noExec || status.NoSUID != tt.noSUID {
+				t.Fatalf("mount status = %#v", status)
+			}
+			if discoveryUsable(true, status) == tt.noExec {
+				t.Fatalf("usable state did not reflect noexec: %#v", status)
+			}
+		})
+	}
+
+	status, err := inspectMount(filepath.Join(t.TempDir(), "missing"))
+	if err == nil || status.Known || discoveryUsable(true, status) {
+		t.Fatalf("failed Statfs was treated as permissive: status=%#v err=%v", status, err)
+	}
+}
+
+func TestCaptureHostSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	writeTestExecutable(t, dir, "sudo")
+	statusPath := filepath.Join(dir, "status")
+	if err := os.WriteFile(statusPath, []byte("NoNewPrivs:\t1\nCapBnd:\tff\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+
+	snapshot := captureHostSnapshotAt(statusPath, true)
+	if snapshot.RealUID != os.Getuid() || snapshot.EffectiveUID != os.Geteuid() {
+		t.Fatalf("UID snapshot = real %d effective %d", snapshot.RealUID, snapshot.EffectiveUID)
+	}
+	if !snapshot.NoNewPrivsKnown || !snapshot.NoNewPrivs || !snapshot.CapBndKnown || snapshot.CapBnd != 0xff {
+		t.Fatalf("process status snapshot = %#v", snapshot)
+	}
+	if !snapshot.SudoPresent || !snapshot.SudoProbeRequested {
+		t.Fatalf("sudo snapshot = %#v", snapshot)
+	}
+
+	t.Setenv("PATH", t.TempDir())
+	missing := captureHostSnapshotAt(filepath.Join(dir, "missing-status"), false)
+	if missing.NoNewPrivsKnown || missing.CapBndKnown || missing.SudoPresent || missing.SudoProbeRequested || len(missing.Warnings) == 0 {
+		t.Fatalf("missing process status was not retained as unknown: %#v", missing)
+	}
+
+	smoke := captureHostSnapshot(false)
+	if smoke.RealUID != os.Getuid() || smoke.EffectiveUID != os.Geteuid() {
+		t.Fatalf("live snapshot lost UIDs: %#v", smoke)
+	}
+}
+
+func TestCaptureHostSnapshotRejectsErrDotSudo(t *testing.T) {
+	dir := t.TempDir()
+	writeTestExecutable(t, dir, "sudo")
+	statusPath := filepath.Join(dir, "status")
+	if err := os.WriteFile(statusPath, []byte("NoNewPrivs:\t0\nCapBnd:\t0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	t.Setenv("PATH", ".")
+
+	snapshot := captureHostSnapshotAt(statusPath, false)
+	if snapshot.SudoPresent || !warningContains(snapshot.Warnings, "current directory") {
+		t.Fatalf("ErrDot sudo snapshot = %#v", snapshot)
+	}
+}
+
+func writeTestExecutable(t *testing.T, dir, name string) string {
+	t.Helper()
+
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("fixture"), 0o700); err != nil {
+		t.Fatalf("os.WriteFile(%q): %v", path, err)
+	}
+	return path
+}
+
+func discoveryNamed(t *testing.T, discoveries []executableDiscovery, name string) executableDiscovery {
+	t.Helper()
+
+	for _, discovery := range discoveries {
+		if discovery.CatalogName == name {
+			return discovery
+		}
+	}
+	t.Fatalf("discovery for %q not found", name)
+	return executableDiscovery{}
 }
 
 func TestFetchCatalogSuccessUsesGET(t *testing.T) {
