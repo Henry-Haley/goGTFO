@@ -408,6 +408,48 @@ func discoveryUsable(executable bool, mount mountStatus) bool {
 	return executable && mount.Known && !mount.NoExec
 }
 
+func evaluateDiscovery(discovery executableDiscovery) applicabilityResult {
+	states := []applicabilityState{stateConfirmed}
+	var evidence []string
+
+	if !discovery.Found {
+		states = append(states, stateUnavailable)
+		evidence = append(evidence, "catalog executable was not found in PATH")
+		return applicabilityResult{State: composeApplicability(states...), Evidence: evidence}
+	}
+	if discovery.FileInfo == nil {
+		states = append(states, stateUnknown)
+		evidence = append(evidence, "canonical target file information could not be determined")
+	} else if !discovery.FileInfo.Mode().IsRegular() {
+		states = append(states, stateUnavailable)
+		evidence = append(evidence, "canonical target is not a regular file")
+	}
+	if discovery.FileInfo != nil && !discovery.Executable {
+		states = append(states, stateUnavailable)
+		evidence = append(evidence, "canonical target is not executable")
+	}
+	if !discovery.Mount.Known {
+		states = append(states, stateUnknown)
+		evidence = append(evidence, "filesystem mount flags could not be determined")
+	} else if discovery.Mount.NoExec {
+		states = append(states, stateUnavailable)
+		evidence = append(evidence, "filesystem is mounted noexec")
+	}
+
+	return applicabilityResult{State: composeApplicability(states...), Evidence: evidence}
+}
+
+func evaluateUnprivileged(discovery executableDiscovery, version string) applicabilityResult {
+	result := evaluateDiscovery(discovery)
+	if version == "" {
+		return result
+	}
+	return composeApplicabilityResults(result, applicabilityResult{
+		State:    stateUnknown,
+		Evidence: []string{"version restriction was not verified: " + version},
+	})
+}
+
 func composeApplicability(states ...applicabilityState) applicabilityState {
 	if len(states) == 0 {
 		return stateUnknown
@@ -430,6 +472,23 @@ func composeApplicability(states ...applicabilityState) applicabilityState {
 		}
 	}
 	return result
+}
+
+func composeApplicabilityResults(results ...applicabilityResult) applicabilityResult {
+	states := make([]applicabilityState, 0, len(results))
+	seen := make(map[string]bool)
+	var evidence []string
+	for _, result := range results {
+		states = append(states, result.State)
+		for _, item := range result.Evidence {
+			if item == "" || seen[item] {
+				continue
+			}
+			seen[item] = true
+			evidence = append(evidence, item)
+		}
+	}
+	return applicabilityResult{State: composeApplicability(states...), Evidence: evidence}
 }
 
 func canonicalOwnerUID(info os.FileInfo) (uint32, bool) {
@@ -733,6 +792,192 @@ func evaluateSudo(input sudoEvaluationInput) applicabilityResult {
 	}
 
 	return applicabilityResult{State: composeApplicability(states...), Evidence: evidence}
+}
+
+func evaluateContext(contextKey string, contextList []string, version string, discovery executableDiscovery, host hostSnapshot, sudoBatch sudoProbeBatch, capabilities map[string]fileCapabilityInspection) applicabilityResult {
+	common := evaluateDiscovery(discovery)
+	fileInspected := discovery.FileInfo != nil
+	regular := fileInspected && discovery.FileInfo.Mode().IsRegular()
+	var mode os.FileMode
+	if fileInspected {
+		mode = discovery.FileInfo.Mode()
+	}
+
+	switch contextKey {
+	case "unprivileged":
+		return evaluateUnprivileged(discovery, version)
+	case "suid":
+		ownerUID, ownerKnown := canonicalOwnerUID(discovery.FileInfo)
+		return composeApplicabilityResults(common, evaluateSUID(suidEvaluationInput{
+			FileInspected:   fileInspected,
+			Regular:         regular,
+			Mode:            mode,
+			OwnerUIDKnown:   ownerKnown,
+			OwnerUID:        ownerUID,
+			Mount:           discovery.Mount,
+			NoNewPrivsKnown: host.NoNewPrivsKnown,
+			NoNewPrivs:      host.NoNewPrivs,
+			Version:         version,
+		}))
+	case "capabilities":
+		// GTFOBins has no structured field proving that a technique works without
+		// effective file capabilities, so the first release requires the flag.
+		return composeApplicabilityResults(common, evaluateCapabilities(capabilityEvaluationInput{
+			FileInspected:    fileInspected,
+			Regular:          regular,
+			Executable:       discovery.Executable,
+			Mount:            discovery.Mount,
+			NoNewPrivsKnown:  host.NoNewPrivsKnown,
+			NoNewPrivs:       host.NoNewPrivs,
+			CapBndKnown:      host.CapBndKnown,
+			CapBnd:           host.CapBnd,
+			Required:         parseRequiredCapabilities(contextList),
+			Xattr:            capabilities[discovery.CanonicalPath],
+			RequireEffective: true,
+			Version:          version,
+		}))
+	case "sudo":
+		present := host.SudoPresent || sudoBatch.SudoPath != ""
+		probe := sudoBatch.Results[discovery.CanonicalPath]
+		if host.SudoProbeRequested && host.SudoPresent && sudoBatch.LookupErr != nil {
+			probe = sudoProbeResult{Status: sudoProbeExecutionError, Err: sudoBatch.LookupErr}
+		}
+		return composeApplicabilityResults(common, evaluateSudo(sudoEvaluationInput{
+			EffectiveUID:   host.EffectiveUID,
+			SudoPresent:    present,
+			ProbeRequested: host.SudoProbeRequested,
+			Probe:          probe,
+			Version:        version,
+		}))
+	default:
+		result := applicabilityResult{
+			State:    stateUnknown,
+			Evidence: []string{fmt.Sprintf("goGTFO has no evaluator for catalog context %q", contextKey)},
+		}
+		if version != "" {
+			result = composeApplicabilityResults(result, applicabilityResult{
+				State:    stateUnknown,
+				Evidence: []string{"version restriction was not verified: " + version},
+			})
+		}
+		return result
+	}
+}
+
+func evaluateTechnique(value technique, discovery executableDiscovery, host hostSnapshot, sudoBatch sudoProbeBatch, capabilities map[string]fileCapabilityInspection) technique {
+	value.MitreIDs = slices.Clone(value.MitreIDs)
+	slices.Sort(value.MitreIDs)
+	value.MitreIDs = slices.Compact(value.MitreIDs)
+	value.Warnings = slices.Clone(value.Warnings)
+
+	result := evaluateContext(value.ContextKey, value.ContextList, value.Version, discovery, host, sudoBatch, capabilities)
+	for _, launcher := range value.Launchers {
+		result = composeApplicabilityResults(result, evaluateContext(launcher.ContextKey, launcher.ContextList, launcher.Version, discovery, host, sudoBatch, capabilities))
+	}
+	for _, warning := range value.Warnings {
+		result = composeApplicabilityResults(result, applicabilityResult{
+			State:    stateUnknown,
+			Evidence: []string{"unresolved companion prerequisite: " + warning},
+		})
+	}
+	value.State = result.State
+	value.Evidence = result.Evidence
+	return value
+}
+
+func evaluateFindings(resolved []finding, discoveries []executableDiscovery, host hostSnapshot, sudoBatch sudoProbeBatch, capabilities map[string]fileCapabilityInspection) []finding {
+	byName := make(map[string]executableDiscovery, len(discoveries))
+	for _, discovery := range discoveries {
+		byName[discovery.CatalogName] = discovery
+	}
+
+	var evaluated []finding
+	for _, value := range resolved {
+		discovery, ok := byName[value.Name]
+		if !ok || !discovery.Found {
+			continue
+		}
+		value.AliasChain = slices.Clone(value.AliasChain)
+		value.Warnings = slices.Clone(value.Warnings)
+		value.InvocablePath = discovery.InvocablePath
+		value.CanonicalPath = discovery.CanonicalPath
+		if discovery.Warning != "" {
+			value.DiscoveryWarnings = []string{discovery.Warning}
+		}
+		techniques := value.Techniques
+		value.Techniques = make([]technique, len(techniques))
+		for index, candidate := range techniques {
+			value.Techniques[index] = evaluateTechnique(candidate, discovery, host, sudoBatch, capabilities)
+		}
+		evaluated = append(evaluated, value)
+	}
+	return evaluated
+}
+
+func findingNeedsContext(value finding, contextKey string) bool {
+	for _, candidate := range value.Techniques {
+		if candidate.ContextKey == contextKey {
+			return true
+		}
+		for _, launcher := range candidate.Launchers {
+			if launcher.ContextKey == contextKey {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func collectCapabilityInspections(findings []finding, discoveries []executableDiscovery, inspect func(string) fileCapabilityInspection) map[string]fileCapabilityInspection {
+	needed := make(map[string]bool)
+	for _, value := range findings {
+		if findingNeedsContext(value, "capabilities") {
+			needed[value.Name] = true
+		}
+	}
+
+	result := make(map[string]fileCapabilityInspection)
+	for _, discovery := range discoveries {
+		path := discovery.CanonicalPath
+		if !discovery.Found || !discovery.Executable || path == "" || !needed[discovery.CatalogName] {
+			continue
+		}
+		if _, cached := result[path]; !cached {
+			result[path] = inspect(path)
+		}
+	}
+	return result
+}
+
+func sudoRelevantDiscoveries(findings []finding, discoveries []executableDiscovery) []executableDiscovery {
+	needed := make(map[string]bool)
+	for _, value := range findings {
+		if findingNeedsContext(value, "sudo") {
+			needed[value.Name] = true
+		}
+	}
+	result := make([]executableDiscovery, 0, len(discoveries))
+	for _, discovery := range discoveries {
+		if discovery.Found && needed[discovery.CatalogName] {
+			result = append(result, discovery)
+		}
+	}
+	return result
+}
+
+func sudoProbeBatchStatus(requested bool, batch sudoProbeBatch) string {
+	if !requested {
+		return "not requested"
+	}
+	if batch.LookupErr != nil || batch.SudoPath == "" {
+		return "unavailable"
+	}
+	for _, result := range batch.Results {
+		if result.Status == sudoProbeBudgetExhausted {
+			return "partial timeout"
+		}
+	}
+	return "completed"
 }
 
 func probeSudoPolicies(parent context.Context, requested bool, discoveries []executableDiscovery, runner sudoRunner) sudoProbeBatch {

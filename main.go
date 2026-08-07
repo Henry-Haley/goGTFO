@@ -3,265 +3,162 @@
 package main
 
 import (
-	"encoding/json"
+	"cmp"
+	"context"
 	"flag"
 	"fmt"
-	"net/http"
+	"io"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
-
-	"github.com/Henry-Haley/goGTFO/internal/mitre"
-	"github.com/Henry-Haley/goGTFO/internal/privileges"
 )
-
-type lolbasCommand struct {
-	Command     string `json:"Command"`
-	Description string `json:"Description"`
-	Usecase     string `json:"Usecase"`
-	Category    string `json:"Category"`
-	Privileges  string `json:"Privileges"`
-	MitreID     string `json:"MitreID"`
-}
-
-type lolbasEntry struct {
-	Name  string `json:"Name"`
-	Desc  string `json:"Description"`
-	Paths []struct {
-		Path string `json:"Path"`
-	} `json:"Full_Path"`
-	Commands []lolbasCommand `json:"Commands"`
-}
-
-func resolveLocalPath(documented string) string {
-	p := filepath.FromSlash(documented)
-	lower := strings.ToLower(p)
-
-	windir := os.Getenv("WINDIR")
-	if windir == "" {
-		windir = os.Getenv("SystemRoot")
-	}
-	userProfile := os.Getenv("USERPROFILE")
-	programFiles := os.Getenv("ProgramFiles")
-	programFilesX86 := os.Getenv("ProgramFiles(x86)")
-
-	switch {
-	case programFilesX86 != "" && strings.HasPrefix(lower, `c:\program files (x86)`):
-		p = filepath.Join(programFilesX86, p[len(`c:\program files (x86)`):])
-	case programFiles != "" && strings.HasPrefix(lower, `c:\program files`):
-		p = filepath.Join(programFiles, p[len(`c:\program files`):])
-	case windir != "" && strings.HasPrefix(lower, `c:\windows`):
-		p = filepath.Join(windir, p[len(`c:\windows`):])
-	case userProfile != "" && strings.HasPrefix(lower, `c:\users\`):
-		parts := strings.SplitN(p, `\`, 4)
-		if len(parts) == 4 {
-			p = filepath.Join(userProfile, parts[3])
-		}
-	}
-
-	return filepath.Clean(p)
-}
-
-func findOnDisk(documented string) []string {
-	resolved := resolveLocalPath(documented)
-	if _, err := os.Stat(resolved); err == nil {
-		return []string{resolved}
-	}
-
-	if strings.Contains(strings.ToLower(documented), `\windowsapps\`) {
-		base := filepath.Base(resolved)
-		if programFiles := os.Getenv("ProgramFiles"); programFiles != "" {
-			matches, err := filepath.Glob(filepath.Join(programFiles, "WindowsApps", "*", base))
-			if err == nil && len(matches) > 0 {
-				return matches
-			}
-		}
-	}
-
-	return nil
-}
-
-func entryLocalPaths(e lolbasEntry) []string {
-	var paths []string
-	seen := make(map[string]struct{})
-	for _, p := range e.Paths {
-		for _, local := range findOnDisk(p.Path) {
-			if _, ok := seen[local]; ok {
-				continue
-			}
-			seen[local] = struct{}{}
-			paths = append(paths, local)
-		}
-	}
-	return paths
-}
-
-func requiresSystem(privileges string) bool {
-	p := strings.ToLower(strings.TrimSpace(privileges))
-	return p == "system"
-}
-
-func requiresAdministrator(privileges string) bool {
-	if requiresSystem(privileges) {
-		return false
-	}
-
-	p := strings.ToLower(strings.TrimSpace(privileges))
-	switch p {
-	case "", "any", "low privileges", "user":
-		return false
-	}
-
-	adminMarkers := []string{
-		"admin",
-		"administrator",
-		"dns admin",
-		"backup operators",
-		"sebackup",
-	}
-	for _, marker := range adminMarkers {
-		if strings.Contains(p, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-func commandVisible(privileges string, isSystem, isAdmin bool) bool {
-	if requiresSystem(privileges) {
-		return isSystem
-	}
-	if isSystem || isAdmin {
-		return true
-	}
-	return !requiresAdministrator(privileges)
-}
-
-func primaryLocalPath(paths []string) string {
-	if len(paths) == 0 {
-		return ""
-	}
-	if len(paths) == 1 {
-		return paths[0]
-	}
-
-	prefs := []string{`\system32\`, `\framework64\`, `\syswow64\`, `\framework\`}
-	for _, pref := range prefs {
-		for _, p := range paths {
-			if strings.Contains(strings.ToLower(p), pref) {
-				return p
-			}
-		}
-	}
-	return paths[0]
-}
-
-func runnableCommands(e lolbasEntry, isSystem, isAdmin bool) []lolbasCommand {
-	var allowed []lolbasCommand
-	for _, cmd := range e.Commands {
-		if commandVisible(cmd.Privileges, isSystem, isAdmin) {
-			allowed = append(allowed, cmd)
-		}
-	}
-	return allowed
-}
 
 const (
-	colorReset   = "\033[0m"
-	colorBold    = "\033[1m"
-	colorDim     = "\033[2m"
-	colorCyan    = "\033[96m"
-	colorOrange  = "\033[38;5;208m"
-	colorGreen   = "\033[92m"
-	colorMagenta = "\033[95m"
+	colorReset  = "\033[0m"
+	colorBold   = "\033[1m"
+	colorDim    = "\033[2m"
+	colorCyan   = "\033[96m"
+	colorOrange = "\033[38;5;208m"
+	colorGreen  = "\033[92m"
+	colorYellow = "\033[93m"
 )
 
-var plainMode, checkSudo bool
+var plainMode bool
 
 type sortMode string
 
 const (
-	sortBinary    sortMode = "binary"
-	sortPrivilege sortMode = "privilege"
-	sortAttack    sortMode = "attack"
+	sortBinary  sortMode = "binary"
+	sortContext sortMode = "context"
+	sortAttack  sortMode = "attack"
 )
 
-func normalizeBinaryName(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
-	s = strings.TrimPrefix(s, `.\`)
-	s = strings.TrimPrefix(s, `/`)
-	s = strings.TrimSuffix(s, ".exe")
-	return s
+type options struct {
+	Help      bool
+	Plain     bool
+	Search    string
+	Sort      sortMode
+	All       bool
+	CheckSudo bool
 }
 
-func binaryNamesMatch(entryName, query string) bool {
-	return normalizeBinaryName(entryName) == normalizeBinaryName(query)
+type reportData struct {
+	Findings            []finding
+	EffectiveUID        int
+	Sort                sortMode
+	AllContexts         bool
+	SudoProbe           string
+	InstalledBinaries   int
+	DisplayedTechniques int
+	HiddenUnknown       int
+	HiddenUnavailable   int
+	CatalogWarnings     int
+	HostWarnings        []string
 }
 
-func displayBinaryName(query string) string {
-	q := strings.TrimSpace(query)
-	q = strings.TrimPrefix(q, `.\`)
-	q = strings.TrimPrefix(q, `/`)
-	if q == "" {
-		return query
+type techniqueRow struct {
+	Finding   *finding
+	Technique technique
+}
+
+type loadingBox struct {
+	message string
+	drawn   bool
+}
+
+func parseOptions(args []string) (options, error) {
+	var value options
+	var rawSort string
+	flags := flag.NewFlagSet("goGTFO", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	flags.BoolVar(&value.Help, "h", false, "show help")
+	flags.BoolVar(&value.Help, "help", false, "show help")
+	flags.BoolVar(&value.Plain, "plain", false, "ASCII-only output for basic terminals")
+	flags.StringVar(&value.Search, "s", "", "search for one catalog executable")
+	flags.StringVar(&value.Search, "search", "", "search for one catalog executable")
+	flags.StringVar(&rawSort, "sort", "binary", "sort by binary, context, or attack")
+	flags.BoolVar(&value.All, "all", false, "show unknown and unavailable contexts")
+	flags.BoolVar(&value.CheckSudo, "check-sudo", false, "check sudo policy non-interactively; checks may be logged")
+	if err := flags.Parse(args); err != nil {
+		return value, err
 	}
-	if !strings.HasSuffix(strings.ToLower(q), ".exe") {
-		q += ".exe"
+	if flags.NArg() != 0 {
+		return value, fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
 	}
-	return q
+	mode, err := parseSortMode(rawSort)
+	if err != nil {
+		return value, err
+	}
+	value.Sort = mode
+	value.Search = strings.TrimSpace(value.Search)
+	return value, nil
 }
 
 func parseSortMode(raw string) (sortMode, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "binary", "b":
 		return sortBinary, nil
-	case "privilege", "priv", "p":
-		return sortPrivilege, nil
-	case "attack", "mitre", "a":
+	case "context", "c", "ctx", "privilege":
+		return sortContext, nil
+	case "attack", "a", "mitre":
 		return sortAttack, nil
 	default:
-		return "", fmt.Errorf("unknown sort %q (use binary, privilege, or attack)", raw)
+		return "", fmt.Errorf("unknown sort %q (use binary, context, or attack)", raw)
 	}
 }
 
-const bannerArt = `
-                   █████                █████      
-                  ░░███                ░░███       
-  ███████  ██████  ░███         ██████  ░███       
- ███░░███ ███░░███ ░███        ███░░███ ░███       
-░███ ░███░███ ░███ ░███       ░███ ░███ ░███       
-░███ ░███░███ ░███ ░███      █░███ ░███ ░███      █
-░░███████░░██████  ███████████░░██████  ███████████
- ░░░░░███ ░░░░░░  ░░░░░░░░░░░  ░░░░░░  ░░░░░░░░░░░ 
- ███ ░███                                          
-░░██████                                           
- ░░░░░░                                            
-`
-
-const plainBannerArt = `
- _____ ____  _     ____  _    
-/  __//  _ \/ \   /  _ \/ \   
-| |  _| / \|| |   | / \|| |   
-| |_//| \_/|| |_/\| \_/|| |_/\
-\____\\____/\____/\____/\____/                           
-`
+func helpExeName() string {
+	if len(os.Args) > 0 {
+		if name := filepath.Base(os.Args[0]); name != "" && name != "." {
+			return name
+		}
+	}
+	return "goGTFO"
+}
 
 func printBanner() {
 	if plainMode {
-		fmt.Print(plainBannerArt)
-		fmt.Println("Author: Aaron Kidwell")
+		fmt.Println("goGTFO")
+		fmt.Println("Maintainer: Henry Haley")
 		fmt.Println(strings.Repeat("-", 48))
 		fmt.Println()
 		return
 	}
-	fmt.Printf("\n%s%s%s", colorCyan, bannerArt, colorReset)
-	fmt.Printf("%sAuthor: Aaron Kidwell%s\n\n", colorGreen, colorReset)
+	fmt.Printf("\n%s%sgoGTFO%s\n", colorCyan, colorBold, colorReset)
+	fmt.Printf("%sMaintainer: Henry Haley%s\n\n", colorGreen, colorReset)
 }
 
-type loadingBox struct {
-	message string
-	drawn   bool
+func printHelp() {
+	printBanner()
+	exe := inlineTerminalText(helpExeName())
+	fmt.Printf(`goGTFO identifies GTFOBins executables available through PATH and evaluates
+their documented Linux contexts. It never executes GTFOBins techniques.
+
+Usage:
+  %s [flags]
+
+Flags:
+  -h, -help          Show this help
+  -plain             ASCII structural output with no terminal control sequences
+  -s, -search name   Show one catalog executable and all context states
+  -sort mode         Sort by binary, context, or attack (default "binary")
+  -all               Show unknown and unavailable contexts
+  -check-sudo        Check sudo policy non-interactively; checks may be logged
+
+Sort aliases:
+  binary:  b
+  context: c, ctx, privilege
+  attack:  a, mitre
+
+Examples:
+  %s
+  %s -s bash
+  %s -plain -all
+  %s -sort context
+  %s -sort attack
+
+`, exe, exe, exe, exe, exe, exe)
 }
 
 func newLoadingBox(message string) *loadingBox {
@@ -281,24 +178,24 @@ func loadingLine(done bool, message string) string {
 	if done {
 		prefix = "✓"
 	}
-	plain := fmt.Sprintf("  %s %s", prefix, message)
-	if len(plain) > 40 {
-		plain = plain[:37] + "..."
+	line := fmt.Sprintf("  %s %s", prefix, message)
+	if len(line) > 40 {
+		line = line[:37] + "..."
 	}
-	return plain + strings.Repeat(" ", 40-len(plain))
+	return line + strings.Repeat(" ", 40-len(line))
 }
 
 func (l *loadingBox) draw(done bool) {
-	inner := loadingLine(done, l.message)
+	line := loadingLine(done, l.message)
 	if done {
-		inner = colorGreen + inner + colorReset
+		line = colorGreen + line + colorReset
 	}
 	if l.drawn {
 		fmt.Print("\033[3A")
 	}
 	l.drawn = true
 	fmt.Printf("\033[2K\r  %s╭──────────────────────────────────────────╮%s\n", colorCyan, colorReset)
-	fmt.Printf("\033[2K\r  %s│%s%s%s│%s\n", colorCyan, colorReset, inner, colorCyan, colorReset)
+	fmt.Printf("\033[2K\r  %s│%s%s%s│%s\n", colorCyan, colorReset, line, colorCyan, colorReset)
 	fmt.Printf("\033[2K\r  %s╰──────────────────────────────────────────╯%s\n", colorCyan, colorReset)
 }
 
@@ -321,601 +218,485 @@ func (l *loadingBox) finish(message string) {
 	fmt.Println()
 }
 
-func helpExeName() string {
-	if len(os.Args) > 0 {
-		if name := filepath.Base(os.Args[0]); name != "" && name != "." {
-			return name
+func run(args []string) int {
+	value, err := parseOptions(args)
+	plainMode = value.Plain
+	if err != nil {
+		fmt.Fprintln(os.Stderr, inlineTerminalText(err.Error()))
+		printHelp()
+		return 2
+	}
+	if value.Help {
+		printHelp()
+		return 0
+	}
+	return runCatalog(context.Background(), value)
+}
+
+func runCatalog(ctx context.Context, value options) int {
+	printBanner()
+	loader := newLoadingBox("Fetching GTFOBins catalog...")
+	loader.start()
+
+	catalogData, err := fetchCatalog(ctx)
+	if err != nil {
+		loader.finish("Failed")
+		fmt.Fprintln(os.Stderr, inlineTerminalText(err.Error()))
+		return 1
+	}
+
+	loader.setMessage("Resolving catalog relationships...")
+	resolved := resolveCatalog(catalogData)
+	selectedFindings := resolved.Findings
+	selectedExecutables := catalogData.Executables
+	if value.Search != "" {
+		search, err := searchCatalogName(catalogData.Executables, value.Search)
+		if err != nil {
+			loader.finish("Not found")
+			fmt.Fprintln(os.Stderr, inlineTerminalText(err.Error()))
+			return 1
+		}
+		selectedFindings = findingsNamed(resolved.Findings, search.Name)
+		selectedExecutables = map[string]executableDef{search.Name: catalogData.Executables[search.Name]}
+	}
+
+	loader.setMessage("Discovering PATH executables...")
+	discoveries := discoverExecutables(selectedExecutables)
+	if value.Search != "" && (len(discoveries) == 0 || !discoveries[0].Found) {
+		loader.finish("Not found in PATH")
+		fmt.Fprintf(os.Stderr, "%s exists in the GTFOBins catalog but was not found in PATH.\n", inlineTerminalText(value.Search))
+		return 1
+	}
+
+	loader.setMessage("Capturing Linux host state...")
+	host := captureHostSnapshot(value.CheckSudo)
+
+	if value.CheckSudo {
+		loader.setMessage("Checking sudo policy...")
+	}
+	sudoBatch := probeSudoPolicies(ctx, value.CheckSudo, sudoRelevantDiscoveries(selectedFindings, discoveries), runSudoProbe)
+
+	loader.setMessage("Checking Linux contexts...")
+	capabilities := collectCapabilityInspections(selectedFindings, discoveries, inspectFileCapabilities)
+	evaluated := evaluateFindings(selectedFindings, discoveries, host, sudoBatch, capabilities)
+
+	loader.setMessage("Preparing output...")
+	showAll := value.All || value.Search != ""
+	report := filterFindings(evaluated, showAll)
+	report.EffectiveUID = host.EffectiveUID
+	report.Sort = value.Sort
+	report.AllContexts = showAll
+	report.SudoProbe = sudoProbeBatchStatus(value.CheckSudo, sudoBatch)
+	report.CatalogWarnings = len(resolved.Warnings)
+	report.HostWarnings = slices.Clone(host.Warnings)
+	loader.finish(fmt.Sprintf("Prepared %d techniques", report.DisplayedTechniques))
+
+	renderReport(report)
+	return 0
+}
+
+func findingsNamed(values []finding, name string) []finding {
+	for _, value := range values {
+		if value.Name == name {
+			return []finding{value}
 		}
 	}
-	return "golol.exe"
+	return nil
 }
 
-func printHelp() {
-	printBanner()
-	exe := helpExeName()
-	if plainMode {
-		fmt.Print(fmt.Sprintf(`Lists LOLBAS binaries present on this machine that match your privilege level,
-with ATT&CK techniques and example commands from lolbas-project.github.io.
-
-Privilege tiers: user, administrator (local Administrators group), and
-SYSTEM (NT AUTHORITY\SYSTEM token). SYSTEM-tier techniques are shown only
-when running as SYSTEM.
-
-Usage:
-  %s [flags]
-
-Flags:
-  -h, -help          Show this help
-  -plain             ASCII-only output for telnet/reverse shells
-  -check-sudo        Check sudo policy non-interactively; checks may be logged
-  -s, -search string Search for one binary (e.g. certutil or certutil.exe)
-  -sort string       Sort results (default "binary")
-                       binary     Group by binary name (A-Z)
-                       privilege  Admin tier first, then user tier
-                       attack     Sort by ATT&CK ID (Txxxx)
-
-Examples:
-  %s
-  %s -s certutil
-  %s -plain
-  %s -sort privilege
-  %s -sort attack
-  %s -h
-
-`, exe, exe, exe, exe, exe, exe, exe))
-		return
+func filterFindings(values []finding, showAll bool) reportData {
+	report := reportData{AllContexts: showAll, InstalledBinaries: len(values)}
+	for _, value := range values {
+		techniques := make([]technique, 0, len(value.Techniques))
+		for _, candidate := range value.Techniques {
+			show := showAll || candidate.State == stateConfirmed || candidate.State == statePotential
+			if !show {
+				switch candidate.State {
+				case stateUnavailable:
+					report.HiddenUnavailable++
+				default:
+					report.HiddenUnknown++
+				}
+				continue
+			}
+			techniques = append(techniques, candidate)
+			report.DisplayedTechniques++
+		}
+		if len(techniques) == 0 {
+			continue
+		}
+		value.Techniques = techniques
+		report.Findings = append(report.Findings, value)
 	}
-	fmt.Printf(`%sLists LOLBAS binaries present on this machine that match your privilege level,
-with ATT&CK techniques and example commands from lolbas-project.github.io.
-
-Privilege tiers: user, administrator (local Administrators group), and
-SYSTEM (NT AUTHORITY\\SYSTEM token). SYSTEM-tier techniques are shown only
-when running as SYSTEM.
-
-%sUsage:%s
-  %s [flags]
-
-%sFlags:%s
-  -h, -help          Show this help
-  -plain             ASCII-only output for telnet/reverse shells
-  -check-sudo        Check sudo policy non-interactively; checks may be logged
-  -s, -search string Search for one binary (e.g. certutil or certutil.exe)
-  -sort string       Sort results (default "binary")
-                       binary     Group by binary name (A-Z)
-                       privilege  Admin tier first, then user tier
-                       attack     Sort by ATT&CK ID (Txxxx)
-
-%sExamples:%s
-  %s
-  %s -s certutil
-  %s -plain
-  %s -sort privilege
-  %s -sort attack
-  %s -h
-
-`, colorDim, colorBold, colorReset, exe, colorBold, colorReset, colorBold, colorReset, exe, exe, exe, exe, exe, exe)
+	return report
 }
 
-func privilegeDisplay(priv string) string {
-	label := strings.TrimSpace(priv)
-	if label == "" {
-		label = "User"
+func compareCatalogNames(a, b string) int {
+	if folded := cmp.Compare(strings.ToLower(a), strings.ToLower(b)); folded != 0 {
+		return folded
 	}
-	if plainMode {
-		return label
+	return cmp.Compare(a, b)
+}
+
+func stateRank(state applicabilityState) int {
+	switch state {
+	case stateConfirmed:
+		return 0
+	case statePotential:
+		return 1
+	case stateUnknown:
+		return 2
+	case stateUnavailable:
+		return 3
+	default:
+		return 4
 	}
-	if requiresSystem(label) {
-		return colorMagenta + label + colorReset
+}
+
+func contextRank(key string) (int, string) {
+	switch key {
+	case "sudo":
+		return 0, ""
+	case "suid":
+		return 1, ""
+	case "capabilities":
+		return 2, ""
+	case "unprivileged":
+		return 3, ""
+	default:
+		return 4, key
 	}
-	if requiresAdministrator(label) {
-		return colorGreen + label + colorReset
+}
+
+func compareContexts(a, b string) int {
+	aRank, aUnknown := contextRank(a)
+	bRank, bUnknown := contextRank(b)
+	if rank := cmp.Compare(aRank, bRank); rank != 0 {
+		return rank
 	}
-	return colorOrange + label + colorReset
+	return cmp.Compare(aUnknown, bUnknown)
 }
 
-type commandEntry struct {
-	privilegeRaw string
-	privilege    string
-	attackID     string
-	attack       string
-	usecase      string
-	command      string
-	isSystemTier bool
-	isAdminTier  bool
+func sortedAttackIDs(ids []string) []string {
+	result := slices.Clone(ids)
+	slices.Sort(result)
+	return slices.Compact(result)
 }
 
-type listItem struct {
-	name        string
-	description string
-	path        string
-	commands    []commandEntry
+func compareAttackIDs(a, b []string) int {
+	a = sortedAttackIDs(a)
+	b = sortedAttackIDs(b)
+	if len(a) == 0 && len(b) != 0 {
+		return 1
+	}
+	if len(a) != 0 && len(b) == 0 {
+		return -1
+	}
+	return slices.Compare(a, b)
 }
 
-type flatRow struct {
-	binary      string
-	description string
-	path        string
-	command     commandEntry
+func firstAttackID(ids []string) string {
+	ids = sortedAttackIDs(ids)
+	if len(ids) == 0 {
+		return ""
+	}
+	return ids[0]
 }
 
-func flattenItems(items []listItem) []flatRow {
-	var rows []flatRow
-	for _, item := range items {
-		for _, cmd := range item.commands {
-			rows = append(rows, flatRow{
-				binary:      item.name,
-				description: item.description,
-				path:        item.path,
-				command:     cmd,
-			})
+func sortBinaryFindings(values []finding) {
+	slices.SortStableFunc(values, func(a, b finding) int {
+		return compareCatalogNames(a.Name, b.Name)
+	})
+	for index := range values {
+		slices.SortStableFunc(values[index].Techniques, func(a, b technique) int {
+			if order := compareContexts(a.ContextKey, b.ContextKey); order != 0 {
+				return order
+			}
+			if order := cmp.Compare(a.FunctionLabel, b.FunctionLabel); order != 0 {
+				return order
+			}
+			if order := cmp.Compare(firstAttackID(a.MitreIDs), firstAttackID(b.MitreIDs)); order != 0 {
+				return order
+			}
+			return cmp.Compare(a.Code, b.Code)
+		})
+	}
+}
+
+func flattenFindings(values []finding) []techniqueRow {
+	var rows []techniqueRow
+	for index := range values {
+		for _, candidate := range values[index].Techniques {
+			rows = append(rows, techniqueRow{Finding: &values[index], Technique: candidate})
 		}
 	}
 	return rows
 }
 
-func sortFlatRows(rows []flatRow, mode sortMode) {
-	sort.Slice(rows, func(i, j int) bool {
-		a, b := rows[i], rows[j]
-		switch mode {
-		case sortPrivilege:
-			if a.command.isSystemTier != b.command.isSystemTier {
-				return a.command.isSystemTier
+func sortTechniqueRows(rows []techniqueRow, mode sortMode) {
+	slices.SortStableFunc(rows, func(a, b techniqueRow) int {
+		if mode == sortContext {
+			if order := cmp.Compare(stateRank(a.Technique.State), stateRank(b.Technique.State)); order != 0 {
+				return order
 			}
-			if a.command.isAdminTier != b.command.isAdminTier {
-				return a.command.isAdminTier
+			if order := compareContexts(a.Technique.ContextKey, b.Technique.ContextKey); order != 0 {
+				return order
 			}
-			if a.command.privilegeRaw != b.command.privilegeRaw {
-				return a.command.privilegeRaw < b.command.privilegeRaw
+			if order := compareCatalogNames(a.Finding.Name, b.Finding.Name); order != 0 {
+				return order
 			}
-			if a.command.attackID != b.command.attackID {
-				return a.command.attackID < b.command.attackID
+			if order := cmp.Compare(a.Technique.FunctionLabel, b.Technique.FunctionLabel); order != 0 {
+				return order
 			}
-			return strings.ToLower(a.binary) < strings.ToLower(b.binary)
-		case sortAttack:
-			if a.command.attackID != b.command.attackID {
-				return a.command.attackID < b.command.attackID
-			}
-			if a.command.isAdminTier != b.command.isAdminTier {
-				return a.command.isAdminTier
-			}
-			return strings.ToLower(a.binary) < strings.ToLower(b.binary)
-		default:
-			bi := strings.ToLower(a.binary)
-			bj := strings.ToLower(b.binary)
-			if bi != bj {
-				return bi < bj
-			}
-			if a.command.isAdminTier != b.command.isAdminTier {
-				return a.command.isAdminTier
-			}
-			return a.command.attackID < b.command.attackID
+			return cmp.Compare(a.Technique.Code, b.Technique.Code)
 		}
+		if order := compareAttackIDs(a.Technique.MitreIDs, b.Technique.MitreIDs); order != 0 {
+			return order
+		}
+		if order := compareCatalogNames(a.Finding.Name, b.Finding.Name); order != 0 {
+			return order
+		}
+		if order := compareContexts(a.Technique.ContextKey, b.Technique.ContextKey); order != 0 {
+			return order
+		}
+		return cmp.Compare(a.Technique.FunctionLabel, b.Technique.FunctionLabel)
 	})
 }
 
-func sortListItems(items []listItem) {
-	sort.Slice(items, func(i, j int) bool {
-		return strings.ToLower(items[i].name) < strings.ToLower(items[j].name)
-	})
-	for i := range items {
-		sort.Slice(items[i].commands, func(a, b int) bool {
-			ca, cb := items[i].commands[a], items[i].commands[b]
-			if ca.isSystemTier != cb.isSystemTier {
-				return ca.isSystemTier
-			}
-			if ca.isAdminTier != cb.isAdminTier {
-				return ca.isAdminTier
-			}
-			return ca.attackID < cb.attackID
-		})
-	}
-}
-
-func roleLabel(isSystem, isAdmin bool) string {
-	if isSystem {
-		if plainMode {
-			return "NT AUTHORITY\\SYSTEM"
-		}
-		return colorMagenta + "NT AUTHORITY\\SYSTEM" + colorReset
-	}
-	if isAdmin {
-		if plainMode {
-			return "administrator"
-		}
-		return colorGreen + "administrator" + colorReset
-	}
-	if plainMode {
-		return "standard user"
-	}
-	return colorOrange + "standard user" + colorReset
-}
-
-func printHeader(isSystem, isAdmin bool, mode sortMode, binaries, techniques int) {
-	role := roleLabel(isSystem, isAdmin)
-	if plainMode {
-		fmt.Println(strings.Repeat("=", 62))
-		fmt.Printf("Role:        %s\n", role)
-		fmt.Printf("Sort:        %s\n", mode)
-		fmt.Printf("Binaries:    %d\n", binaries)
-		fmt.Printf("Techniques:  %d\n", techniques)
-		fmt.Println(strings.Repeat("=", 62))
-		fmt.Println()
-		return
-	}
-	fmt.Printf("  %sRole:%s        %s\n", colorDim, colorReset, role)
-	fmt.Printf("  %sSort:%s        %s\n", colorDim, colorReset, mode)
-	fmt.Printf("  %sBinaries:%s    %d\n", colorDim, colorReset, binaries)
-	fmt.Printf("  %sTechniques:%s  %d\n\n", colorDim, colorReset, techniques)
-}
-
-func printSection(title string) {
-	if plainMode {
-		fmt.Printf("\n== %s ==\n\n", title)
-		return
-	}
-	fmt.Printf("\n  %s%s\n", title, colorReset)
-	fmt.Printf("  %s%s%s\n\n", colorDim, strings.Repeat("─", 62), colorReset)
-}
-
-func flatRowTitle(mode sortMode, row flatRow) string {
-	switch mode {
-	case sortAttack:
-		id := row.command.attackID
-		if id == "" {
-			if plainMode {
-				id = "-"
-			} else {
-				id = "—"
-			}
-		}
-		if plainMode {
-			return fmt.Sprintf("%s - %s", id, row.binary)
-		}
-		return fmt.Sprintf("%s · %s", id, row.binary)
-	case sortPrivilege:
-		tier := "User tier"
-		switch {
-		case row.command.isSystemTier:
-			tier = "SYSTEM tier"
-		case row.command.isAdminTier:
-			tier = "Admin tier"
-		}
-		if plainMode {
-			return fmt.Sprintf("%s - %s", tier, row.binary)
-		}
-		return fmt.Sprintf("%s · %s", tier, row.binary)
-	default:
-		return row.binary
-	}
+func inlineTerminalText(value string) string {
+	value = sanitizeTerminalText(value)
+	value = strings.ReplaceAll(value, "\n", " ")
+	return strings.ReplaceAll(value, "\t", " ")
 }
 
 func printField(label, value string) {
-	if plainMode {
-		fmt.Printf("  %-14s %s\n", label+":", value)
-		return
+	lines := strings.Split(sanitizeTerminalText(value), "\n")
+	fmt.Printf("  %-22s %s\n", label+":", lines[0])
+	for _, line := range lines[1:] {
+		fmt.Printf("  %-22s %s\n", "", line)
 	}
-	fmt.Printf("  %s%-14s%s %s\n", colorDim, label, colorReset, value)
 }
 
-func printDivider() {
+func printHeader(report reportData) {
+	line := strings.Repeat("=", 64)
 	if plainMode {
-		fmt.Printf("  %s\n", strings.Repeat("-", 62))
-		return
+		fmt.Println(line)
+	} else {
+		fmt.Printf("%s%s%s\n", colorDim, line, colorReset)
 	}
-	fmt.Printf("  %s%s%s\n", colorDim, strings.Repeat("─", 62), colorReset)
+	printField("Effective UID", fmt.Sprint(report.EffectiveUID))
+	printField("Effective UID 0", fmt.Sprint(report.EffectiveUID == 0))
+	printField("Sort", string(report.Sort))
+	printField("All contexts", fmt.Sprint(report.AllContexts))
+	printField("Sudo probe", report.SudoProbe)
+	printField("Installed binaries", fmt.Sprint(report.InstalledBinaries))
+	printField("Displayed techniques", fmt.Sprint(report.DisplayedTechniques))
+	printField("Hidden unknown", fmt.Sprint(report.HiddenUnknown))
+	printField("Hidden unavailable", fmt.Sprint(report.HiddenUnavailable))
+	printField("Catalog warnings", fmt.Sprint(report.CatalogWarnings))
+	for _, warning := range report.HostWarnings {
+		printField("Host warning", warning)
+	}
+	if plainMode {
+		fmt.Println(line)
+	} else {
+		fmt.Printf("%s%s%s\n", colorDim, line, colorReset)
+	}
+	fmt.Println()
 }
 
-func printFlatRows(rows []flatRow, mode sortMode) {
-	var prevSection string
-	for i, row := range rows {
-		section := flatSectionKey(mode, row)
-		if section != prevSection {
-			if prevSection != "" {
+func stateDisplay(state applicabilityState) string {
+	value := inlineTerminalText(string(state))
+	if plainMode {
+		return value
+	}
+	switch state {
+	case stateConfirmed:
+		return colorGreen + value + colorReset
+	case statePotential:
+		return colorOrange + value + colorReset
+	case stateUnknown:
+		return colorYellow + value + colorReset
+	default:
+		return colorDim + value + colorReset
+	}
+}
+
+func printStateField(state applicabilityState) {
+	if plainMode {
+		printField("State", string(state))
+		return
+	}
+	fmt.Printf("  %-22s %s\n", "State:", stateDisplay(state))
+}
+
+func functionDisplay(value technique) string {
+	label := value.FunctionLabel
+	if strings.TrimSpace(label) == "" {
+		label = value.FunctionKey
+	}
+	if !strings.EqualFold(strings.TrimSpace(label), strings.TrimSpace(value.FunctionKey)) {
+		return label + " (" + value.FunctionKey + ")"
+	}
+	return label
+}
+
+func contextDisplay(value technique) string {
+	label := value.ContextLabel
+	if strings.TrimSpace(label) == "" {
+		label = value.ContextKey
+	}
+	if !strings.EqualFold(strings.TrimSpace(label), strings.TrimSpace(value.ContextKey)) {
+		return label + " (" + value.ContextKey + ")"
+	}
+	return label
+}
+
+func renderFindingHeader(index int, value finding) {
+	name := inlineTerminalText(value.Name)
+	if plainMode {
+		fmt.Printf("[%d] %s\n", index, name)
+	} else {
+		fmt.Printf("%s%s[%d] %s%s\n", colorCyan, colorBold, index, name, colorReset)
+	}
+	printField("Invocable path", value.InvocablePath)
+	if value.CanonicalPath != "" && value.CanonicalPath != value.InvocablePath {
+		printField("Canonical target", value.CanonicalPath)
+	}
+	if len(value.AliasChain) != 0 {
+		printField("Alias chain", strings.Join(value.AliasChain, " -> "))
+	}
+	if value.Comment != "" {
+		printField("Executable comment", value.Comment)
+	}
+	for _, warning := range value.Warnings {
+		printField("Entry warning", warning)
+	}
+	for _, warning := range value.DiscoveryWarnings {
+		printField("Discovery warning", warning)
+	}
+}
+
+func renderOptionalBool(label string, value *bool) {
+	if value != nil {
+		printField(label, fmt.Sprint(*value))
+	}
+}
+
+func renderTechnique(index int, value technique) {
+	fmt.Printf("  -- technique %d --\n", index)
+	printField("Function", functionDisplay(value))
+	printField("Context", contextDisplay(value))
+	if value.ContextDescription != "" {
+		printField("Context description", value.ContextDescription)
+	}
+	printStateField(value.State)
+	for _, evidence := range value.Evidence {
+		printField("Evidence", evidence)
+	}
+	if ids := sortedAttackIDs(value.MitreIDs); len(ids) != 0 {
+		printField("ATT&CK", strings.Join(ids, ", "))
+	}
+	if value.Description != "" {
+		printField("Description", value.Description)
+	}
+	if value.Code != "" {
+		printField("Command", value.Code)
+	}
+	if value.ExampleComment != "" {
+		printField("Example comment", value.ExampleComment)
+	}
+	if value.ContextComment != "" {
+		printField("Context comment", value.ContextComment)
+	}
+	if value.Version != "" {
+		printField("Version restriction", value.Version)
+	}
+	if value.ContextShell != "" {
+		printField("Context shell", value.ContextShell)
+	}
+	if len(value.ContextList) != 0 {
+		printField("Context requirements", strings.Join(value.ContextList, ", "))
+	}
+	if len(value.InheritanceChain) != 0 {
+		printField("Inheritance chain", strings.Join(value.InheritanceChain, " -> "))
+	}
+	for launcherIndex, launcher := range value.Launchers {
+		prefix := fmt.Sprintf("Launcher %d", launcherIndex+1)
+		printField(prefix, launcher.Executable+" ["+launcher.ContextKey+"]")
+		if launcher.Code != "" {
+			printField(prefix+" command", launcher.Code)
+		}
+		if launcher.ExampleComment != "" {
+			printField(prefix+" comment", launcher.ExampleComment)
+		}
+		if launcher.ContextComment != "" {
+			printField(prefix+" context", launcher.ContextComment)
+		}
+		if launcher.Version != "" {
+			printField(prefix+" version", launcher.Version)
+		}
+		if launcher.ContextShell != "" {
+			printField(prefix+" shell", launcher.ContextShell)
+		}
+		if len(launcher.ContextList) != 0 {
+			printField(prefix+" requirements", strings.Join(launcher.ContextList, ", "))
+		}
+		renderOptionalBool(prefix+" blind", launcher.Blind)
+		renderOptionalBool(prefix+" TTY", launcher.TTY)
+		renderOptionalBool(prefix+" binary", launcher.Binary)
+	}
+	for _, companion := range value.Companions {
+		label := "Companion " + companion.Role
+		if companion.Comment != "" {
+			printField(label+" comment", companion.Comment)
+		}
+		if companion.Code != "" {
+			printField(label+" command", companion.Code)
+		}
+	}
+	renderOptionalBool("Blind", value.Blind)
+	renderOptionalBool("TTY", value.TTY)
+	renderOptionalBool("Binary", value.Binary)
+	for _, warning := range value.Warnings {
+		printField("Technique warning", warning)
+	}
+}
+
+func renderReport(report reportData) {
+	printHeader(report)
+	if report.DisplayedTechniques == 0 {
+		fmt.Println("No techniques matched the current display filter.")
+		return
+	}
+
+	if report.Sort == sortBinary {
+		sortBinaryFindings(report.Findings)
+		for index, value := range report.Findings {
+			if index != 0 {
 				fmt.Println()
 			}
-			printSection(flatSectionLabel(mode, row))
-			prevSection = section
-		} else if i > 0 {
-			fmt.Println()
-		}
-
-		if plainMode {
-			fmt.Printf("  [%d] %s\n", i+1, flatRowTitle(mode, row))
-		} else {
-			fmt.Printf("  %s╭─%s %s[%d]%s %s%s%s\n", colorCyan, colorReset, colorDim, i+1, colorReset, colorBold, flatRowTitle(mode, row), colorReset)
-		}
-		printField("Path", row.path)
-		printField("Description", row.description)
-		printDivider()
-		printField("Privileges", row.command.privilege)
-		printField("ATT&CK", row.command.attack)
-		printField("Use case", row.command.usecase)
-		printField("Command", row.command.command)
-		if plainMode {
-			fmt.Printf("  %s\n", strings.Repeat("-", 62))
-		} else {
-			fmt.Printf("  %s╰%s\n", colorCyan, strings.Repeat("─", 63))
-		}
-	}
-}
-
-func flatSectionKey(mode sortMode, row flatRow) string {
-	switch mode {
-	case sortAttack:
-		return row.command.attackID
-	case sortPrivilege:
-		switch {
-		case row.command.isSystemTier:
-			return "system"
-		case row.command.isAdminTier:
-			return "admin"
-		default:
-			return "user"
-		}
-	default:
-		return ""
-	}
-}
-
-func flatSectionLabel(mode sortMode, row flatRow) string {
-	switch mode {
-	case sortAttack:
-		label := row.command.attack
-		if label == "" {
-			label = row.command.attackID
-		}
-		if label == "" {
-			label = "Unknown technique"
-		}
-		if plainMode {
-			return label
-		}
-		return colorBold + label + colorReset
-	case sortPrivilege:
-		switch {
-		case row.command.isSystemTier:
-			if plainMode {
-				return "SYSTEM tier"
+			renderFindingHeader(index+1, value)
+			for techniqueIndex, candidate := range value.Techniques {
+				renderTechnique(techniqueIndex+1, candidate)
 			}
-			return colorBold + colorMagenta + "SYSTEM tier" + colorReset
-		case row.command.isAdminTier:
-			if plainMode {
-				return "Administrator tier"
-			}
-			return colorBold + colorGreen + "Administrator tier" + colorReset
-		default:
-			if plainMode {
-				return "User tier"
-			}
-			return colorBold + colorOrange + "User tier" + colorReset
+			fmt.Println(strings.Repeat("-", 64))
 		}
-	default:
-		return ""
-	}
-}
-
-func printGroupedItems(items []listItem) {
-	for i, item := range items {
-		if i > 0 {
-			fmt.Println()
-		}
-		if plainMode {
-			fmt.Printf("  [%d] %s\n", i+1, item.name)
-		} else {
-			fmt.Printf("  %s╭─%s %s[%d]%s %s%s%s\n", colorCyan, colorReset, colorDim, i+1, colorReset, colorBold, item.name, colorReset)
-		}
-		printField("Path", item.path)
-		printField("Description", item.description)
-
-		for j, cmd := range item.commands {
-			if plainMode {
-				fmt.Printf("  -- technique %d\n", j+1)
-			} else {
-				fmt.Printf("  %s├─ technique %d%s\n", colorCyan, j+1, colorReset)
-			}
-			printField("Privileges", cmd.privilege)
-			printField("ATT&CK", cmd.attack)
-			printField("Use case", cmd.usecase)
-			printField("Command", cmd.command)
-		}
-		if plainMode {
-			fmt.Printf("  %s\n", strings.Repeat("-", 62))
-		} else {
-			fmt.Printf("  %s╰%s\n", colorCyan, strings.Repeat("─", 63))
-		}
-	}
-}
-
-func printResults(items []listItem, isSystem, isAdmin bool, mode sortMode) {
-	techniques := 0
-	for _, item := range items {
-		techniques += len(item.commands)
-	}
-	printHeader(isSystem, isAdmin, mode, len(items), techniques)
-
-	if mode == sortBinary {
-		printGroupedItems(items)
 		return
 	}
 
-	rows := flattenItems(items)
-	sortFlatRows(rows, mode)
-	printFlatRows(rows, mode)
+	rows := flattenFindings(report.Findings)
+	sortTechniqueRows(rows, report.Sort)
+	for index, row := range rows {
+		if index != 0 {
+			fmt.Println()
+		}
+		renderFindingHeader(index+1, *row.Finding)
+		renderTechnique(1, row.Technique)
+		fmt.Println(strings.Repeat("-", 64))
+	}
 }
 
 func main() {
-	help := flag.Bool("h", false, "show help")
-	helpLong := flag.Bool("help", false, "show help")
-	plainFlag := flag.Bool("plain", false, "ASCII-only output for telnet/reverse shells")
-	flag.BoolVar(&checkSudo, "check-sudo", false, "check sudo policy non-interactively; checks may be logged")
-	var searchQuery string
-	flag.StringVar(&searchQuery, "s", "", "search for a specific binary by name")
-	flag.StringVar(&searchQuery, "search", "", "search for a specific binary by name")
-	sortFlag := flag.String("sort", "binary", "sort by: binary, privilege, attack")
-	flag.Parse()
-
-	plainMode = *plainFlag
-	searchQuery = strings.TrimSpace(searchQuery)
-
-	if *help || *helpLong {
-		printHelp()
-		return
-	}
-
-	sortMode, err := parseSortMode(*sortFlag)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		printHelp()
-		os.Exit(2)
-	}
-	printBanner()
-
-	loader := newLoadingBox("Checking privileges...")
-	loader.start()
-
-	loader.setMessage("Checking process token...")
-	isSystem, err := privileges.IsLocalSystem()
-	if err != nil {
-		loader.finish("Failed")
-		fmt.Println("Failed to check process token:", err)
-		return
-	}
-
-	loader.setMessage("Checking local group membership...")
-	isAdmin, err := privileges.IsLocalAdministrator()
-	if err != nil {
-		loader.finish("Failed")
-		fmt.Println("Failed to check local group membership:", err)
-		return
-	}
-
-	loader.setMessage("Fetching LOLBAS catalog...")
-	resp, err := http.Get("https://lolbas-project.github.io/api/lolbas.json")
-	if err != nil {
-		loader.finish("Failed")
-		fmt.Println("Failed to fetch LOLBAS list:", err)
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		loader.finish("Failed")
-		fmt.Println("Unexpected status:", resp.Status)
-		return
-	}
-
-	loader.setMessage("Parsing LOLBAS catalog...")
-	var entries []lolbasEntry
-	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
-		loader.finish("Failed")
-		fmt.Println("Failed to parse JSON:", err)
-		return
-	}
-
-	if searchQuery != "" {
-		loader.setMessage(fmt.Sprintf("Searching for %s...", displayBinaryName(searchQuery)))
-	} else {
-		loader.setMessage("Scanning local binaries...")
-	}
-	seenPaths := make(map[string]struct{})
-	var items []listItem
-	for i, e := range entries {
-		if searchQuery != "" && !binaryNamesMatch(e.Name, searchQuery) {
-			continue
-		}
-
-		if searchQuery == "" && i > 0 && i%40 == 0 {
-			loader.setMessage(fmt.Sprintf("Scanning local binaries... (%d/%d)", i, len(entries)))
-		}
-
-		paths := entryLocalPaths(e)
-		path := primaryLocalPath(paths)
-		if path == "" {
-			if searchQuery != "" {
-				loader.finish("Not found")
-				fmt.Printf("%s is not available on disk.\n", displayBinaryName(searchQuery))
-				return
-			}
-			continue
-		}
-
-		pathKey := strings.ToLower(path)
-		if _, ok := seenPaths[pathKey]; ok {
-			continue
-		}
-
-		commands := runnableCommands(e, isSystem, isAdmin)
-		if len(commands) == 0 {
-			if searchQuery != "" {
-				loader.finish("No techniques")
-				fmt.Printf("%s is on disk at %s but no techniques are available at your privilege level.\n", e.Name, path)
-				return
-			}
-			continue
-		}
-
-		sort.Slice(commands, func(i, j int) bool {
-			sysI := requiresSystem(commands[i].Privileges)
-			sysJ := requiresSystem(commands[j].Privileges)
-			if sysI != sysJ {
-				return sysI
-			}
-			adminI := requiresAdministrator(commands[i].Privileges)
-			adminJ := requiresAdministrator(commands[j].Privileges)
-			if adminI != adminJ {
-				return adminI
-			}
-			return commands[i].MitreID < commands[j].MitreID
-		})
-
-		seenPaths[pathKey] = struct{}{}
-
-		commandEntries := make([]commandEntry, 0, len(commands))
-		for _, cmd := range commands {
-			privRaw := strings.TrimSpace(cmd.Privileges)
-			if privRaw == "" {
-				privRaw = "User"
-			}
-			commandEntries = append(commandEntries, commandEntry{
-				privilegeRaw: privRaw,
-				privilege:    privilegeDisplay(cmd.Privileges),
-				attackID:     strings.TrimSpace(cmd.MitreID),
-				attack:       mitre.TechniqueLabel(cmd.MitreID),
-				usecase:      cmd.Usecase,
-				command:      cmd.Command,
-				isSystemTier: requiresSystem(cmd.Privileges),
-				isAdminTier:  requiresAdministrator(cmd.Privileges),
-			})
-		}
-
-		items = append(items, listItem{
-			name:        e.Name,
-			description: e.Desc,
-			path:        path,
-			commands:    commandEntries,
-		})
-	}
-
-	if len(items) == 0 {
-		if searchQuery != "" {
-			loader.finish("Not found")
-			fmt.Printf("%s is not available on disk.\n", displayBinaryName(searchQuery))
-			return
-		}
-		loader.finish("No runnable binaries found")
-		fmt.Println("No runnable LOLBAS binaries found on this host.")
-		return
-	}
-
-	loader.finish(fmt.Sprintf("Found %d binaries, %d techniques", len(items), countTechniques(items)))
-
-	sortListItems(items)
-	printResults(items, isSystem, isAdmin, sortMode)
-}
-
-func countTechniques(items []listItem) int {
-	n := 0
-	for _, item := range items {
-		n += len(item.commands)
-	}
-	return n
+	os.Exit(run(os.Args[1:]))
 }

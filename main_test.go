@@ -16,7 +16,9 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 	"unicode"
 
 	"golang.org/x/sys/unix"
@@ -142,7 +144,7 @@ func TestResolveCatalogFixture(t *testing.T) {
 		t.Fatalf("capability list = %v", capabilities.ContextList)
 	}
 	unknownContext := techniqueNamed(t, tool, "command", "fixture-context")
-	if unknownContext.ContextKey == "unprivileged" || unknownContext.ContextLabel != "Unknown fixture context" {
+	if unknownContext.ContextKey == "unprivileged" || unknownContext.ContextLabel != "Unknown fixture context" || unknownContext.ContextDescription == "" {
 		t.Fatalf("unknown context was remapped: %#v", unknownContext)
 	}
 	unknownFunction := techniqueNamed(t, tool, "fixture-unknown", "unprivileged")
@@ -848,12 +850,48 @@ func TestComposeApplicability(t *testing.T) {
 	}
 }
 
+func TestComposeApplicabilityResultsDeduplicatesEvidence(t *testing.T) {
+	got := composeApplicabilityResults(
+		applicabilityResult{State: stateConfirmed, Evidence: []string{"first", "shared"}},
+		applicabilityResult{State: stateUnknown, Evidence: []string{"shared", "second"}},
+	)
+	if got.State != stateUnknown || !reflect.DeepEqual(got.Evidence, []string{"first", "shared", "second"}) {
+		t.Fatalf("composed result = %#v", got)
+	}
+}
+
 type fileInfoWithSys struct {
 	os.FileInfo
 	sys any
 }
 
 func (info fileInfoWithSys) Sys() any { return info.sys }
+
+type staticFileInfo struct {
+	name string
+	mode os.FileMode
+	uid  uint32
+}
+
+func (info staticFileInfo) Name() string       { return info.name }
+func (info staticFileInfo) Size() int64        { return 1 }
+func (info staticFileInfo) Mode() os.FileMode  { return info.mode }
+func (info staticFileInfo) ModTime() time.Time { return time.Time{} }
+func (info staticFileInfo) IsDir() bool        { return info.mode.IsDir() }
+func (info staticFileInfo) Sys() any           { return &syscall.Stat_t{Uid: info.uid} }
+
+func staticDiscovery(name, invocable, canonical string, mode os.FileMode, mount mountStatus) executableDiscovery {
+	return executableDiscovery{
+		CatalogName:   name,
+		Found:         true,
+		InvocablePath: invocable,
+		CanonicalPath: canonical,
+		FileInfo:      staticFileInfo{name: filepath.Base(canonical), mode: mode},
+		Executable:    mode.Perm()&0o111 != 0,
+		Mount:         mount,
+		Usable:        discoveryUsable(mode.Perm()&0o111 != 0, mount),
+	}
+}
 
 func TestCanonicalOwnerUID(t *testing.T) {
 	path := writeTestExecutable(t, t.TempDir(), "owner-fixture")
@@ -1489,6 +1527,590 @@ func TestHelpDocumentsCheckSudo(t *testing.T) {
 		if !strings.Contains(output, "-check-sudo") || !strings.Contains(output, "Check sudo policy non-interactively; checks may be logged") {
 			t.Fatalf("plain=%v help does not document safe sudo probing: %q", plain, output)
 		}
+	}
+}
+
+func TestEvaluateDiscoveryAndUnprivileged(t *testing.T) {
+	base := staticDiscovery("Tool", "/Fixture/Bin/Tool", "/Fixture/Bin/Tool", 0o755, mountStatus{Known: true})
+	tests := []struct {
+		name     string
+		change   func(*executableDiscovery)
+		version  string
+		want     applicabilityState
+		evidence string
+	}{
+		{"usable", func(*executableDiscovery) {}, "", stateConfirmed, ""},
+		{"not found", func(value *executableDiscovery) { value.Found = false }, "", stateUnavailable, "not found in PATH"},
+		{"inspection failed", func(value *executableDiscovery) { value.FileInfo = nil; value.Mount = mountStatus{} }, "", stateUnknown, "file information could not be determined"},
+		{"not regular", func(value *executableDiscovery) {
+			value.FileInfo = staticFileInfo{name: "Tool", mode: os.ModeDir | 0o755}
+		}, "", stateUnavailable, "not a regular file"},
+		{"not executable", func(value *executableDiscovery) { value.Executable = false }, "", stateUnavailable, "not executable"},
+		{"mount unknown", func(value *executableDiscovery) { value.Mount = mountStatus{} }, "", stateUnknown, "mount flags could not be determined"},
+		{"noexec", func(value *executableDiscovery) { value.Mount.NoExec = true }, "", stateUnavailable, "mounted noexec"},
+		{"version", func(*executableDiscovery) {}, "fixture <= 1", stateUnknown, "version restriction was not verified"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			discovery := base
+			tt.change(&discovery)
+			got := evaluateUnprivileged(discovery, tt.version)
+			if got.State != tt.want || (tt.evidence != "" && !warningContains(got.Evidence, tt.evidence)) {
+				t.Fatalf("evaluateUnprivileged() = %#v, want %q containing %q", got, tt.want, tt.evidence)
+			}
+		})
+	}
+}
+
+func TestEvaluateFindingsIntegratesContexts(t *testing.T) {
+	path := "/Fixture/Bin/Tool"
+	discovery := staticDiscovery("Tool", path, path, os.ModeSetuid|0o755, mountStatus{Known: true})
+	required := uint64(1) << unix.CAP_SETUID
+	host := hostSnapshot{
+		procStatus:   procStatus{NoNewPrivsKnown: true, CapBndKnown: true, CapBnd: required},
+		EffectiveUID: 1000,
+		SudoPresent:  true,
+	}
+	base := finding{Name: "Tool", Techniques: []technique{
+		{FunctionKey: "command", ContextKey: "unprivileged", Code: "unprivileged-code"},
+		{FunctionKey: "command", ContextKey: "suid", Code: "suid-code"},
+		{FunctionKey: "command", ContextKey: "capabilities", ContextList: []string{"CAP_SETUID"}, Code: "capability-code"},
+		{FunctionKey: "command", ContextKey: "sudo", Code: "sudo-code"},
+		{FunctionKey: "command", ContextKey: "future-context", ContextLabel: "Future", Code: "future-code"},
+	}}
+	capabilities := map[string]fileCapabilityInspection{
+		path: {Known: true, Present: true, Capabilities: fileCapabilities{Permitted: required, Effective: true}},
+	}
+
+	evaluated := evaluateFindings([]finding{base}, []executableDiscovery{discovery}, host, sudoProbeBatch{}, capabilities)
+	if len(evaluated) != 1 || evaluated[0].InvocablePath != path || evaluated[0].CanonicalPath != path {
+		t.Fatalf("evaluated finding = %#v", evaluated)
+	}
+	want := map[string]applicabilityState{
+		"unprivileged":   stateConfirmed,
+		"suid":           stateConfirmed,
+		"capabilities":   stateConfirmed,
+		"sudo":           stateUnknown,
+		"future-context": stateUnknown,
+	}
+	for _, candidate := range evaluated[0].Techniques {
+		if candidate.State != want[candidate.ContextKey] {
+			t.Fatalf("context %q state = %q, want %q; evidence %v", candidate.ContextKey, candidate.State, want[candidate.ContextKey], candidate.Evidence)
+		}
+	}
+	if !warningContains(techniqueNamed(t, evaluated[0], "command", "future-context").Evidence, "no evaluator") {
+		t.Fatal("unknown context lacks evaluator evidence")
+	}
+	unknownOnNoExec := discovery
+	unknownOnNoExec.Mount.NoExec = true
+	unknownResult := evaluateFindings([]finding{base}, []executableDiscovery{unknownOnNoExec}, host, sudoProbeBatch{}, capabilities)[0]
+	if value := techniqueNamed(t, unknownResult, "command", "future-context"); value.State != stateUnknown {
+		t.Fatalf("unknown context was remapped by host state: %#v", value)
+	}
+
+	t.Run("SUID unavailable evidence reaches technique", func(t *testing.T) {
+		withoutSetuid := discovery
+		withoutSetuid.FileInfo = staticFileInfo{name: "Tool", mode: 0o755}
+		result := evaluateFindings([]finding{base}, []executableDiscovery{withoutSetuid}, host, sudoProbeBatch{}, capabilities)[0]
+		value := techniqueNamed(t, result, "command", "suid")
+		if value.State != stateUnavailable || !warningContains(value.Evidence, "does not have setuid bit") {
+			t.Fatalf("SUID result = %#v", value)
+		}
+	})
+
+	t.Run("capability missing and unknown requirements", func(t *testing.T) {
+		missing := map[string]fileCapabilityInspection{path: {Known: true}}
+		result := evaluateFindings([]finding{base}, []executableDiscovery{discovery}, host, sudoProbeBatch{}, missing)[0]
+		if value := techniqueNamed(t, result, "command", "capabilities"); value.State != stateUnavailable || !warningContains(value.Evidence, "not present") {
+			t.Fatalf("missing capability result = %#v", value)
+		}
+
+		unknown := base
+		unknown.Techniques = slices.Clone(base.Techniques)
+		for index := range unknown.Techniques {
+			if unknown.Techniques[index].ContextKey == "capabilities" {
+				unknown.Techniques[index].ContextList = []string{"CAP_FIXTURE"}
+			}
+		}
+		result = evaluateFindings([]finding{unknown}, []executableDiscovery{discovery}, host, sudoProbeBatch{}, capabilities)[0]
+		if value := techniqueNamed(t, result, "command", "capabilities"); value.State != stateUnknown || !warningContains(value.Evidence, "CAP_FIXTURE") {
+			t.Fatalf("unknown capability result = %#v", value)
+		}
+	})
+
+	t.Run("sudo recognized version and effective UID zero", func(t *testing.T) {
+		requested := host
+		requested.SudoProbeRequested = true
+		batch := sudoProbeBatch{SudoPath: "/usr/bin/sudo", Results: map[string]sudoProbeResult{path: {Status: sudoProbeRecognized}}}
+		result := evaluateFindings([]finding{base}, []executableDiscovery{discovery}, requested, batch, capabilities)[0]
+		if value := techniqueNamed(t, result, "command", "sudo"); value.State != statePotential {
+			t.Fatalf("recognized sudo result = %#v", value)
+		}
+
+		versioned := base
+		versioned.Techniques = slices.Clone(base.Techniques)
+		for index := range versioned.Techniques {
+			if versioned.Techniques[index].ContextKey == "sudo" {
+				versioned.Techniques[index].Version = "fixture <= 1"
+			}
+		}
+		result = evaluateFindings([]finding{versioned}, []executableDiscovery{discovery}, requested, batch, capabilities)[0]
+		if value := techniqueNamed(t, result, "command", "sudo"); value.State != stateUnknown {
+			t.Fatalf("versioned sudo result = %#v", value)
+		}
+
+		root := host
+		root.EffectiveUID = 0
+		result = evaluateFindings([]finding{base}, []executableDiscovery{discovery}, root, sudoProbeBatch{}, capabilities)[0]
+		if value := techniqueNamed(t, result, "command", "sudo"); value.State != stateConfirmed {
+			t.Fatalf("effective UID zero sudo result = %#v", value)
+		}
+	})
+}
+
+func TestInheritanceAndCompanionUncertainty(t *testing.T) {
+	discovery := staticDiscovery("Parent", "/Fixture/Parent", "/Fixture/Parent", 0o755, mountStatus{Known: true})
+	host := hostSnapshot{procStatus: procStatus{NoNewPrivsKnown: true, CapBndKnown: true}}
+	value := finding{Name: "Parent", Techniques: []technique{{
+		FunctionKey: "command",
+		ContextKey:  "unprivileged",
+		Code:        "target-code",
+		Launchers: []launcherStep{{
+			Executable: "Parent",
+			ContextKey: "unprivileged",
+			Code:       "launcher-code",
+			Version:    "launcher <= 1",
+		}},
+	}}}
+	result := evaluateFindings([]finding{value}, []executableDiscovery{discovery}, host, sudoProbeBatch{}, nil)[0]
+	candidate := result.Techniques[0]
+	if candidate.State != stateUnknown || candidate.Code != "target-code" || candidate.Launchers[0].Code != "launcher-code" || !warningContains(candidate.Evidence, "launcher <= 1") {
+		t.Fatalf("inheritance evaluation = %#v", candidate)
+	}
+
+	value.Techniques[0].Launchers = nil
+	value.Techniques[0].Warnings = []string{"companion listener reference is missing"}
+	result = evaluateFindings([]finding{value}, []executableDiscovery{discovery}, host, sudoProbeBatch{}, nil)[0]
+	candidate = result.Techniques[0]
+	if candidate.State != stateUnknown || !reflect.DeepEqual(candidate.Warnings, value.Techniques[0].Warnings) || !warningContains(candidate.Evidence, "unresolved companion prerequisite") {
+		t.Fatalf("companion uncertainty = %#v", candidate)
+	}
+}
+
+func TestCapabilityInspectionCache(t *testing.T) {
+	findings := []finding{
+		{Name: "A", Techniques: []technique{{ContextKey: "capabilities"}}},
+		{Name: "B", Techniques: []technique{{ContextKey: "capabilities"}}},
+		{Name: "C", Techniques: []technique{{ContextKey: "unprivileged"}}},
+		{Name: "D", Techniques: []technique{{ContextKey: "unprivileged", Launchers: []launcherStep{{ContextKey: "capabilities"}}}}},
+	}
+	discoveries := []executableDiscovery{
+		staticDiscovery("A", "/Alias/A", "/Canonical/Shared", 0o755, mountStatus{Known: true}),
+		staticDiscovery("B", "/Alias/B", "/Canonical/Shared", 0o755, mountStatus{Known: true}),
+		staticDiscovery("C", "/Canonical/C", "/Canonical/C", 0o755, mountStatus{Known: true}),
+		staticDiscovery("D", "/Canonical/D", "/Canonical/D", 0o755, mountStatus{Known: true}),
+	}
+	calls := make(map[string]int)
+	cache := collectCapabilityInspections(findings, discoveries, func(path string) fileCapabilityInspection {
+		calls[path]++
+		return fileCapabilityInspection{Known: true}
+	})
+	if len(cache) != 2 || calls["/Canonical/Shared"] != 1 || calls["/Canonical/D"] != 1 || calls["/Canonical/C"] != 0 {
+		t.Fatalf("capability cache/calls = %#v/%v", cache, calls)
+	}
+}
+
+func TestSudoProbeBatchStatus(t *testing.T) {
+	tests := []struct {
+		name      string
+		requested bool
+		batch     sudoProbeBatch
+		want      string
+	}{
+		{"not requested", false, sudoProbeBatch{}, "not requested"},
+		{"lookup unavailable", true, sudoProbeBatch{LookupErr: errors.New("missing")}, "unavailable"},
+		{"not attempted", true, sudoProbeBatch{}, "unavailable"},
+		{"completed", true, sudoProbeBatch{SudoPath: "/usr/bin/sudo", Results: map[string]sudoProbeResult{"/tool": {Status: sudoProbeRecognized}}}, "completed"},
+		{"partial timeout", true, sudoProbeBatch{SudoPath: "/usr/bin/sudo", Results: map[string]sudoProbeResult{"/tool": {Status: sudoProbeBudgetExhausted}}}, "partial timeout"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sudoProbeBatchStatus(tt.requested, tt.batch); got != tt.want {
+				t.Fatalf("sudoProbeBatchStatus() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseOptionsAndHelpBeforeNetwork(t *testing.T) {
+	for raw, want := range map[string]sortMode{
+		"binary": sortBinary, "b": sortBinary,
+		"context": sortContext, "c": sortContext, "ctx": sortContext, "privilege": sortContext,
+		"attack": sortAttack, "a": sortAttack, "mitre": sortAttack,
+	} {
+		value, err := parseOptions([]string{"-sort", raw})
+		if err != nil || value.Sort != want {
+			t.Fatalf("parseOptions(-sort %s) = %#v, %v", raw, value, err)
+		}
+	}
+	value, err := parseOptions([]string{"-plain", "-all", "-check-sudo", "-search", "Tool"})
+	if err != nil || !value.Plain || !value.All || !value.CheckSudo || value.Search != "Tool" {
+		t.Fatalf("parsed options = %#v, %v", value, err)
+	}
+	if _, err := parseOptions([]string{"-sort", "invalid"}); err == nil {
+		t.Fatal("invalid sort was accepted")
+	}
+
+	output := captureProcessOutput(t, func() {
+		if code := run([]string{"-plain", "-h"}); code != 0 {
+			t.Fatalf("help exit = %d", code)
+		}
+	})
+	for _, text := range []string{"goGTFO identifies GTFOBins", "never executes GTFOBins techniques", "-all", "-check-sudo", "binary, context, or attack"} {
+		if !strings.Contains(output, text) {
+			t.Fatalf("help lacks %q: %s", text, output)
+		}
+	}
+	for _, stale := range []string{"LOLBAS", "Windows", "Administrator", "SYSTEM", "Aaron Kidwell"} {
+		if strings.Contains(output, stale) {
+			t.Fatalf("help contains stale runtime wording %q: %s", stale, output)
+		}
+	}
+}
+
+func TestFilteringAndCounts(t *testing.T) {
+	values := []finding{
+		{Name: "A", CanonicalPath: "/Shared", Techniques: []technique{
+			{ContextKey: "unprivileged", State: stateConfirmed},
+			{ContextKey: "sudo", State: statePotential},
+			{ContextKey: "capabilities", State: stateUnknown},
+			{ContextKey: "suid", State: stateUnavailable},
+		}},
+		{Name: "B", CanonicalPath: "/Shared", Techniques: []technique{{ContextKey: "unprivileged", State: stateConfirmed}}},
+	}
+
+	filtered := filterFindings(values, false)
+	if filtered.InstalledBinaries != 2 || filtered.DisplayedTechniques != 3 || filtered.HiddenUnknown != 1 || filtered.HiddenUnavailable != 1 || len(filtered.Findings) != 2 {
+		t.Fatalf("default filtering = %#v", filtered)
+	}
+	if len(values[0].Techniques) != 4 {
+		t.Fatal("filtering mutated evaluated findings")
+	}
+
+	all := filterFindings(values, true)
+	if !all.AllContexts || all.DisplayedTechniques != 5 || all.HiddenUnknown != 0 || all.HiddenUnavailable != 0 {
+		t.Fatalf("all filtering = %#v", all)
+	}
+	search := options{Search: "A"}
+	searchReport := filterFindings(values[:1], search.Search != "")
+	if searchReport.DisplayedTechniques != 4 || !searchReport.AllContexts {
+		t.Fatalf("search did not imply all contexts: %#v", searchReport)
+	}
+}
+
+func TestBinarySorting(t *testing.T) {
+	values := []finding{
+		{Name: "beta", Techniques: []technique{{ContextKey: "unprivileged", FunctionLabel: "B", MitreIDs: []string{"T2"}, Code: "b"}}},
+		{Name: "alpha", Techniques: []technique{
+			{ContextKey: "future-z", FunctionLabel: "Z", Code: "z"},
+			{ContextKey: "sudo", FunctionLabel: "B", MitreIDs: []string{"T2"}, Code: "b"},
+			{ContextKey: "sudo", FunctionLabel: "A", MitreIDs: []string{"T2"}, Code: "a"},
+		}},
+		{Name: "Alpha", Techniques: []technique{{ContextKey: "unprivileged", FunctionLabel: "A", Code: "a"}}},
+	}
+	sortBinaryFindings(values)
+	if got := []string{values[0].Name, values[1].Name, values[2].Name}; !reflect.DeepEqual(got, []string{"Alpha", "alpha", "beta"}) {
+		t.Fatalf("binary order = %v", got)
+	}
+	if got := []string{values[1].Techniques[0].FunctionLabel, values[1].Techniques[1].FunctionLabel, values[1].Techniques[2].ContextKey}; !reflect.DeepEqual(got, []string{"A", "B", "future-z"}) {
+		t.Fatalf("binary technique order = %v", got)
+	}
+}
+
+func TestContextSortingAndRanks(t *testing.T) {
+	findings := []finding{
+		{Name: "D", Techniques: []technique{{State: stateUnavailable, ContextKey: "sudo", FunctionLabel: "F"}}},
+		{Name: "C", Techniques: []technique{{State: stateUnknown, ContextKey: "future-z", FunctionLabel: "F"}}},
+		{Name: "B", Techniques: []technique{{State: stateUnknown, ContextKey: "future-a", FunctionLabel: "F"}}},
+		{Name: "A", Techniques: []technique{
+			{State: statePotential, ContextKey: "capabilities", FunctionLabel: "F"},
+			{State: stateConfirmed, ContextKey: "unprivileged", FunctionLabel: "F"},
+			{State: stateConfirmed, ContextKey: "sudo", FunctionLabel: "F"},
+		}},
+	}
+	rows := flattenFindings(findings)
+	sortTechniqueRows(rows, sortContext)
+	var got []string
+	for _, row := range rows {
+		got = append(got, string(row.Technique.State)+"/"+row.Technique.ContextKey+"/"+row.Finding.Name)
+	}
+	want := []string{
+		"confirmed/sudo/A",
+		"confirmed/unprivileged/A",
+		"potential/capabilities/A",
+		"unknown/future-a/B",
+		"unknown/future-z/C",
+		"unavailable/sudo/D",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("context order = %v, want %v", got, want)
+	}
+}
+
+func TestAttackSortingKeepsOneRowPerTechnique(t *testing.T) {
+	findings := []finding{
+		{Name: "Empty", Techniques: []technique{{ContextKey: "sudo", FunctionLabel: "F"}}},
+		{Name: "MultiB", Techniques: []technique{{ContextKey: "sudo", FunctionLabel: "F", MitreIDs: []string{"T0003", "T0001"}}}},
+		{Name: "MultiA", Techniques: []technique{{ContextKey: "sudo", FunctionLabel: "F", MitreIDs: []string{"T0002", "T0001"}}}},
+		{Name: "First", Techniques: []technique{{ContextKey: "sudo", FunctionLabel: "F", MitreIDs: []string{"T0000"}}}},
+	}
+	rows := flattenFindings(findings)
+	if len(rows) != 4 {
+		t.Fatalf("multi-ATT&CK technique duplicated before sort: %d rows", len(rows))
+	}
+	sortTechniqueRows(rows, sortAttack)
+	var got []string
+	for _, row := range rows {
+		got = append(got, row.Finding.Name)
+	}
+	if !reflect.DeepEqual(got, []string{"First", "MultiA", "MultiB", "Empty"}) {
+		t.Fatalf("ATT&CK order = %v", got)
+	}
+	if len(rows[1].Technique.MitreIDs) != 2 {
+		t.Fatal("multi-ATT&CK technique became multiple rows")
+	}
+}
+
+func TestRendererPreservesPlainDataAndSanitizesAtBoundary(t *testing.T) {
+	previousPlainMode := plainMode
+	defer func() { plainMode = previousPlainMode }()
+	falseValue := false
+	trueValue := true
+	report := reportData{
+		EffectiveUID:        1000,
+		Sort:                sortBinary,
+		SudoProbe:           "not requested",
+		InstalledBinaries:   1,
+		DisplayedTechniques: 1,
+		CatalogWarnings:     1,
+		HostWarnings:        []string{"host warning one", "host warning two"},
+		Findings: []finding{{
+			Name:          "CaseTool\x1b[2J",
+			InvocablePath: "/Fixture/Case/Tool",
+			Techniques: []technique{{
+				FunctionKey:   "command",
+				FunctionLabel: "Command",
+				ContextKey:    "unprivileged",
+				ContextLabel:  "Unprivileged",
+				State:         stateConfirmed,
+				Code:          "first line\n  second line\n",
+				MitreIDs:      []string{"T0002", "T0001"},
+				Blind:         &falseValue,
+				TTY:           &trueValue,
+				Binary:        &falseValue,
+			}},
+		}},
+	}
+	before := report.Findings[0].Techniques[0].Code
+	plainMode = true
+	output := captureProcessOutput(t, func() { renderReport(report) })
+	if strings.Contains(output, "\x1b") || strings.ContainsAny(output, "╭│╰─✓") {
+		t.Fatalf("plain renderer emitted terminal controls or box drawing: %q", output)
+	}
+	for _, want := range []string{
+		"/Fixture/Case/Tool",
+		"Blind:                 false",
+		"TTY:                   true",
+		"Binary:                false",
+		"ATT&CK:                T0001, T0002",
+		"Catalog warnings:      1",
+		"Host warning:          host warning one",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("plain output lacks %q:\n%s", want, output)
+		}
+	}
+	lines := strings.Split(output, "\n")
+	multilinePreserved := false
+	for index, line := range lines {
+		if strings.HasSuffix(line, "  second line") && index+1 < len(lines) && lines[index+1] != "" && strings.TrimSpace(lines[index+1]) == "" {
+			multilinePreserved = true
+			break
+		}
+	}
+	if !strings.Contains(output, "Command:               first line\n") || !multilinePreserved {
+		t.Fatalf("multiline command was joined, trimmed, or truncated:\n%s", output)
+	}
+	if report.Findings[0].Techniques[0].Code != before {
+		t.Fatal("rendering mutated normalized command data")
+	}
+
+	plainMode = false
+	colored := captureProcessOutput(t, func() { renderReport(report) })
+	if !strings.Contains(colored, colorGreen+"confirmed"+colorReset) || !strings.Contains(colored, colorCyan+colorBold+"[1] CaseTool[2J"+colorReset) {
+		t.Fatalf("color was not applied after sanitization: %q", colored)
+	}
+}
+
+func TestPlainOutputGolden(t *testing.T) {
+	previousPlainMode := plainMode
+	defer func() { plainMode = previousPlainMode }()
+	catalogData := loadFixtureCatalog(t)
+	resolved := resolveCatalog(catalogData)
+	if len(resolved.Warnings) != 0 {
+		t.Fatalf("fixture resolution warnings: %v", resolved.Warnings)
+	}
+
+	tool := findingNamed(t, resolved, "fixture-tool")
+	tool.Techniques = []technique{
+		techniqueNamed(t, tool, "command", "sudo"),
+		techniqueNamed(t, tool, "command", "capabilities"),
+		techniqueNamed(t, tool, "fixture-unknown", "unprivileged"),
+	}
+	alias := findingNamed(t, resolved, "fixture-alias")
+	alias.Techniques = []technique{techniqueNamed(t, alias, "fixture-unknown", "unprivileged")}
+	parent := findingNamed(t, resolved, "fixture-parent")
+	parent.Techniques = []technique{techniqueNamed(t, parent, "command", "unprivileged")}
+	selected := []finding{tool, alias, parent}
+
+	toolPath := "/Fixture/Bin/fixture-tool"
+	discoveries := []executableDiscovery{
+		staticDiscovery("fixture-tool", toolPath, toolPath, 0o755, mountStatus{Known: true}),
+		staticDiscovery("fixture-alias", "/Fixture/Bin/fixture-alias", toolPath, 0o755, mountStatus{Known: true}),
+		staticDiscovery("fixture-parent", "/Fixture/Bin/fixture-parent", "/Fixture/Bin/fixture-parent", 0o755, mountStatus{Known: true}),
+	}
+	host := hostSnapshot{
+		procStatus:         procStatus{NoNewPrivsKnown: true, CapBndKnown: true},
+		EffectiveUID:       1000,
+		SudoPresent:        true,
+		SudoProbeRequested: true,
+	}
+	sudoBatch := sudoProbeBatch{
+		SudoPath: "/usr/bin/sudo",
+		Results:  map[string]sudoProbeResult{toolPath: {Status: sudoProbeRecognized}},
+	}
+	capabilities := map[string]fileCapabilityInspection{
+		toolPath: {Known: true, Present: true, Capabilities: fileCapabilities{Effective: true}},
+	}
+	evaluated := evaluateFindings(selected, discoveries, host, sudoBatch, capabilities)
+	report := filterFindings(evaluated, true)
+	report.EffectiveUID = host.EffectiveUID
+	report.Sort = sortBinary
+	report.SudoProbe = sudoProbeBatchStatus(true, sudoBatch)
+	report.CatalogWarnings = len(resolved.Warnings)
+
+	plainMode = true
+	got := captureProcessOutput(t, func() { renderReport(report) })
+	want := `================================================================
+  Effective UID:         1000
+  Effective UID 0:       false
+  Sort:                  binary
+  All contexts:          true
+  Sudo probe:            completed
+  Installed binaries:    3
+  Displayed techniques:  5
+  Hidden unknown:        0
+  Hidden unavailable:    0
+  Catalog warnings:      0
+================================================================
+
+[1] fixture-alias
+  Invocable path:        /Fixture/Bin/fixture-alias
+  Canonical target:      /Fixture/Bin/fixture-tool
+  Alias chain:           fixture-alias -> fixture-tool
+  Executable comment:    Synthetic executable used only by tests.
+  -- technique 1 --
+  Function:              Unknown fixture function (fixture-unknown)
+  Context:               Unprivileged
+  Context description:   Synthetic unprivileged context.
+  State:                 confirmed
+  ATT&CK:                T0003
+  Description:           Exercises forward-compatible function decoding.
+  Command:               echo fixture
+----------------------------------------------------------------
+
+[2] fixture-parent
+  Invocable path:        /Fixture/Bin/fixture-parent
+  -- technique 1 --
+  Function:              Fixture command (command)
+  Context:               Unprivileged
+  Context description:   Synthetic unprivileged context.
+  State:                 unknown
+  Evidence:              version restriction was not verified: fixture-version <= 1
+  ATT&CK:                T0001, T0002
+  Description:           Runs a harmless fixture command.
+  Command:               fixture-command --example
+  Example comment:       Harmless placeholder example.
+  Version restriction:   fixture-version <= 1
+  Inheritance chain:     fixture-parent -> fixture-tool
+  Launcher 1:            fixture-parent [unprivileged]
+  Launcher 1 command:    fixture-command --example
+  Companion listener comment: Synthetic shared companion.
+  Companion listener command: echo fixture
+  Companion connector comment: Synthetic inline companion.
+  Companion connector command: echo fixture
+  Blind:                 false
+  TTY:                   true
+  Binary:                false
+----------------------------------------------------------------
+
+[3] fixture-tool
+  Invocable path:        /Fixture/Bin/fixture-tool
+  Executable comment:    Synthetic executable used only by tests.
+  -- technique 1 --
+  Function:              Fixture command (command)
+  Context:               Sudo
+  Context description:   Synthetic sudo context.
+  State:                 unknown
+  Evidence:              sudo policy recognized the canonical executable path
+  Evidence:              path-level sudo evidence does not prove the full GTFOBins command line is authorized
+  Evidence:              version restriction was not verified: fixture-version <= 1
+  ATT&CK:                T0001, T0002
+  Description:           Runs a harmless fixture command.
+  Command:               fixture-command --sudo-example
+  Example comment:       Harmless placeholder example.
+  Context comment:       Synthetic context-specific override.
+  Version restriction:   fixture-version <= 1
+  Companion listener comment: Synthetic shared companion.
+  Companion listener command: echo fixture
+  Companion connector comment: Synthetic inline companion.
+  Companion connector command: echo fixture
+  Blind:                 false
+  TTY:                   true
+  Binary:                false
+  -- technique 2 --
+  Function:              Fixture command (command)
+  Context:               Capabilities
+  Context description:   Synthetic capability context.
+  State:                 unknown
+  Evidence:              unknown required capability CAP_FIXTURE
+  Evidence:              version restriction was not verified: fixture-version <= 1
+  ATT&CK:                T0001, T0002
+  Description:           Runs a harmless fixture command.
+  Command:               fixture-command --example
+  Example comment:       Harmless placeholder example.
+  Version restriction:   fixture-version <= 1
+  Context requirements:  CAP_FIXTURE
+  Companion listener comment: Synthetic shared companion.
+  Companion listener command: echo fixture
+  Companion connector comment: Synthetic inline companion.
+  Companion connector command: echo fixture
+  Blind:                 false
+  TTY:                   true
+  Binary:                false
+  -- technique 3 --
+  Function:              Unknown fixture function (fixture-unknown)
+  Context:               Unprivileged
+  Context description:   Synthetic unprivileged context.
+  State:                 confirmed
+  ATT&CK:                T0003
+  Description:           Exercises forward-compatible function decoding.
+  Command:               echo fixture
+----------------------------------------------------------------
+`
+	if got != want {
+		t.Fatalf("plain output mismatch\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
 }
 

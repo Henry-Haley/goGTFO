@@ -82,34 +82,40 @@ type resolutionResult struct {
 }
 
 type finding struct {
-	Name       string
-	AliasChain []string
-	Comment    string
-	Techniques []technique
-	Warnings   []string
+	Name              string
+	InvocablePath     string
+	CanonicalPath     string
+	AliasChain        []string
+	Comment           string
+	Techniques        []technique
+	Warnings          []string
+	DiscoveryWarnings []string
 }
 
 type technique struct {
-	TargetExecutable string
-	FunctionKey      string
-	FunctionLabel    string
-	Description      string
-	MitreIDs         []string
-	ContextKey       string
-	ContextLabel     string
-	Code             string
-	ExampleComment   string
-	ContextComment   string
-	Version          string
-	ContextShell     string
-	ContextList      []string
-	Blind            *bool
-	TTY              *bool
-	Binary           *bool
-	Companions       []companionCommand
-	InheritanceChain []string
-	Launchers        []launcherStep
-	Warnings         []string
+	TargetExecutable   string
+	FunctionKey        string
+	FunctionLabel      string
+	Description        string
+	MitreIDs           []string
+	ContextKey         string
+	ContextLabel       string
+	ContextDescription string
+	Code               string
+	ExampleComment     string
+	ContextComment     string
+	Version            string
+	ContextShell       string
+	ContextList        []string
+	Blind              *bool
+	TTY                *bool
+	Binary             *bool
+	Companions         []companionCommand
+	InheritanceChain   []string
+	Launchers          []launcherStep
+	Warnings           []string
+	State              applicabilityState
+	Evidence           []string
 }
 
 type companionCommand struct {
@@ -432,24 +438,25 @@ func normalizeTechnique(c catalog, originalName, executableName, functionKey, co
 
 	companions, warnings := resolveCompanions(function, example, originalName, functionKey, contextKey)
 	return technique{
-		TargetExecutable: executableName,
-		FunctionKey:      functionKey,
-		FunctionLabel:    functionLabel,
-		Description:      function.Description,
-		MitreIDs:         append([]string(nil), function.Mitre...),
-		ContextKey:       contextKey,
-		ContextLabel:     contextLabel,
-		Code:             context.Code,
-		ExampleComment:   example.Comment,
-		ContextComment:   context.Comment,
-		Version:          example.Version,
-		ContextShell:     context.Shell,
-		ContextList:      append([]string(nil), context.List...),
-		Blind:            example.Blind,
-		TTY:              example.TTY,
-		Binary:           example.Binary,
-		Companions:       companions,
-		Warnings:         warnings,
+		TargetExecutable:   executableName,
+		FunctionKey:        functionKey,
+		FunctionLabel:      functionLabel,
+		Description:        function.Description,
+		MitreIDs:           append([]string(nil), function.Mitre...),
+		ContextKey:         contextKey,
+		ContextLabel:       contextLabel,
+		ContextDescription: contextMeta.Description,
+		Code:               context.Code,
+		ExampleComment:     example.Comment,
+		ContextComment:     context.Comment,
+		Version:            example.Version,
+		ContextShell:       context.Shell,
+		ContextList:        append([]string(nil), context.List...),
+		Blind:              example.Blind,
+		TTY:                example.TTY,
+		Binary:             example.Binary,
+		Companions:         companions,
+		Warnings:           warnings,
 	}, nil
 }
 
