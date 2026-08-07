@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
@@ -809,6 +810,392 @@ func discoveryNamed(t *testing.T, discoveries []executableDiscovery, name string
 	}
 	t.Fatalf("discovery for %q not found", name)
 	return executableDiscovery{}
+}
+
+func TestComposeApplicability(t *testing.T) {
+	tests := []struct {
+		name   string
+		states []applicabilityState
+		want   applicabilityState
+	}{
+		{"confirmed", []applicabilityState{stateConfirmed}, stateConfirmed},
+		{"potential", []applicabilityState{statePotential}, statePotential},
+		{"unknown", []applicabilityState{stateUnknown}, stateUnknown},
+		{"unavailable", []applicabilityState{stateUnavailable}, stateUnavailable},
+		{"confirmed potential", []applicabilityState{stateConfirmed, statePotential}, statePotential},
+		{"confirmed unknown", []applicabilityState{stateConfirmed, stateUnknown}, stateUnknown},
+		{"confirmed unavailable", []applicabilityState{stateConfirmed, stateUnavailable}, stateUnavailable},
+		{"potential unknown", []applicabilityState{statePotential, stateUnknown}, stateUnknown},
+		{"potential unavailable", []applicabilityState{statePotential, stateUnavailable}, stateUnavailable},
+		{"unknown unavailable", []applicabilityState{stateUnknown, stateUnavailable}, stateUnavailable},
+		{"confirmed potential unknown", []applicabilityState{stateConfirmed, statePotential, stateUnknown}, stateUnknown},
+		{"confirmed unknown unavailable", []applicabilityState{stateConfirmed, stateUnknown, stateUnavailable}, stateUnavailable},
+		{"empty", nil, stateUnknown},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := composeApplicability(tt.states...); got != tt.want {
+				t.Fatalf("composeApplicability(%v) = %q, want %q", tt.states, got, tt.want)
+			}
+			reversed := slices.Clone(tt.states)
+			slices.Reverse(reversed)
+			if got := composeApplicability(reversed...); got != tt.want {
+				t.Fatalf("reverse-order composeApplicability(%v) = %q, want %q", reversed, got, tt.want)
+			}
+		})
+	}
+}
+
+type fileInfoWithSys struct {
+	os.FileInfo
+	sys any
+}
+
+func (info fileInfoWithSys) Sys() any { return info.sys }
+
+func TestCanonicalOwnerUID(t *testing.T) {
+	path := writeTestExecutable(t, t.TempDir(), "owner-fixture")
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid, known := canonicalOwnerUID(info)
+	if !known || uid != uint32(os.Getuid()) {
+		t.Fatalf("canonicalOwnerUID() = %d, %v; want %d, true", uid, known, os.Getuid())
+	}
+	for _, candidate := range []os.FileInfo{nil, fileInfoWithSys{FileInfo: info, sys: struct{}{}}} {
+		if uid, known := canonicalOwnerUID(candidate); known || uid != 0 {
+			t.Fatalf("canonicalOwnerUID(%#v) = %d, %v; want unknown", candidate, uid, known)
+		}
+	}
+}
+
+func validSUIDEvaluationInput() suidEvaluationInput {
+	return suidEvaluationInput{
+		FileInspected:   true,
+		Regular:         true,
+		Mode:            0o755 | os.ModeSetuid,
+		OwnerUIDKnown:   true,
+		Mount:           mountStatus{Known: true},
+		NoNewPrivsKnown: true,
+	}
+}
+
+func TestEvaluateSUID(t *testing.T) {
+	tests := []struct {
+		name     string
+		change   func(*suidEvaluationInput)
+		want     applicabilityState
+		evidence string
+	}{
+		{"fully valid root-owned SUID", func(*suidEvaluationInput) {}, stateConfirmed, ""},
+		{"non-root owner", func(input *suidEvaluationInput) { input.OwnerUID = 1000 }, stateUnavailable, "owner UID is 1000"},
+		{"setuid absent", func(input *suidEvaluationInput) { input.Mode &^= os.ModeSetuid }, stateUnavailable, "does not have setuid bit"},
+		{"non-regular", func(input *suidEvaluationInput) { input.Regular = false }, stateUnavailable, "not a regular file"},
+		{"nosuid", func(input *suidEvaluationInput) { input.Mount.NoSUID = true }, stateUnavailable, "mounted nosuid"},
+		{"noexec", func(input *suidEvaluationInput) { input.Mount.NoExec = true }, stateUnavailable, "mounted noexec"},
+		{"NoNewPrivs enabled", func(input *suidEvaluationInput) { input.NoNewPrivs = true }, stateUnavailable, "NoNewPrivs is enabled"},
+		{"owner unknown", func(input *suidEvaluationInput) { input.OwnerUIDKnown = false }, stateUnknown, "owner UID could not be determined"},
+		{"mount unknown", func(input *suidEvaluationInput) { input.Mount.Known = false }, stateUnknown, "mount flags could not be determined"},
+		{"NoNewPrivs unknown", func(input *suidEvaluationInput) { input.NoNewPrivsKnown = false }, stateUnknown, "NoNewPrivs could not be determined"},
+		{"version restriction", func(input *suidEvaluationInput) { input.Version = "fixture <= 1" }, stateUnknown, "version restriction was not verified"},
+		{"setuid absent outranks version", func(input *suidEvaluationInput) { input.Mode &^= os.ModeSetuid; input.Version = "fixture <= 1" }, stateUnavailable, "does not have setuid bit"},
+		{"NoNewPrivs outranks unknown mount", func(input *suidEvaluationInput) { input.NoNewPrivs = true; input.Mount.Known = false }, stateUnavailable, "NoNewPrivs is enabled"},
+		{"file inspection unknown", func(input *suidEvaluationInput) { input.FileInspected = false }, stateUnknown, "file information could not be determined"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := validSUIDEvaluationInput()
+			tt.change(&input)
+			got := evaluateSUID(input)
+			if got.State != tt.want {
+				t.Fatalf("state = %q, want %q; evidence %v", got.State, tt.want, got.Evidence)
+			}
+			if tt.want == stateConfirmed && len(got.Evidence) != 0 {
+				t.Fatalf("confirmed result has evidence %v", got.Evidence)
+			}
+			if tt.want != stateConfirmed && (len(got.Evidence) == 0 || !warningContains(got.Evidence, tt.evidence)) {
+				t.Fatalf("evidence = %v, want containing %q", got.Evidence, tt.evidence)
+			}
+			if again := evaluateSUID(input); !reflect.DeepEqual(got, again) {
+				t.Fatalf("evidence order changed: first %v, second %v", got.Evidence, again.Evidence)
+			}
+		})
+	}
+}
+
+func TestSUIDEvidenceOrder(t *testing.T) {
+	input := validSUIDEvaluationInput()
+	input.Mode &^= os.ModeSetuid
+	input.OwnerUID = 1000
+	input.Mount.NoExec = true
+	input.Version = "fixture <= 1"
+	want := []string{
+		"canonical target does not have setuid bit",
+		"canonical target owner UID is 1000, expected 0",
+		"filesystem is mounted noexec",
+		"version restriction was not verified: fixture <= 1",
+	}
+	if got := evaluateSUID(input); got.State != stateUnavailable || !reflect.DeepEqual(got.Evidence, want) {
+		t.Fatalf("evaluateSUID() = %#v, want unavailable with %v", got, want)
+	}
+}
+
+func capabilityXattrFixture(revision uint32, permitted, inheritable uint64, effective bool, rootID uint32) []byte {
+	size := vfsCapabilityRevision2Size
+	if revision == vfsCapabilityRevision3 {
+		size = vfsCapabilityRevision3Size
+	}
+	data := make([]byte, size)
+	magic := revision
+	if effective {
+		magic |= vfsCapabilityEffective
+	}
+	binary.LittleEndian.PutUint32(data[0:4], magic)
+	binary.LittleEndian.PutUint32(data[4:8], uint32(permitted))
+	binary.LittleEndian.PutUint32(data[8:12], uint32(inheritable))
+	binary.LittleEndian.PutUint32(data[12:16], uint32(permitted>>32))
+	binary.LittleEndian.PutUint32(data[16:20], uint32(inheritable>>32))
+	if revision == vfsCapabilityRevision3 {
+		binary.LittleEndian.PutUint32(data[20:24], rootID)
+	}
+	return data
+}
+
+func TestDecodeFileCapabilities(t *testing.T) {
+	highPermitted := uint64(1) << unix.CAP_BPF
+	highInheritable := uint64(1) << unix.CAP_CHECKPOINT_RESTORE
+	tests := []struct {
+		name string
+		data []byte
+		want fileCapabilities
+	}{
+		{
+			"revision 2 lower words",
+			capabilityXattrFixture(vfsCapabilityRevision2, uint64(1)<<unix.CAP_SETUID, uint64(1)<<unix.CAP_NET_RAW, false, 0),
+			fileCapabilities{Revision: vfsCapabilityRevision2, Permitted: uint64(1) << unix.CAP_SETUID, Inheritable: uint64(1) << unix.CAP_NET_RAW},
+		},
+		{
+			"revision 2 upper words and effective",
+			capabilityXattrFixture(vfsCapabilityRevision2, highPermitted, highInheritable, true, 0),
+			fileCapabilities{Revision: vfsCapabilityRevision2, Permitted: highPermitted, Inheritable: highInheritable, Effective: true},
+		},
+		{
+			"revision 3 root ID and combined masks",
+			capabilityXattrFixture(vfsCapabilityRevision3, highPermitted|1, highInheritable|2, true, 4242),
+			fileCapabilities{Revision: vfsCapabilityRevision3, Permitted: highPermitted | 1, Inheritable: highInheritable | 2, Effective: true, RootID: 4242, HasRootID: true},
+		},
+		{
+			"effective independent of permitted",
+			capabilityXattrFixture(vfsCapabilityRevision2, 0, 0, true, 0),
+			fileCapabilities{Revision: vfsCapabilityRevision2, Effective: true},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := decodeFileCapabilities(tt.data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("decoded capabilities = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDecodeFileCapabilitiesRejectsMalformedData(t *testing.T) {
+	revision2 := capabilityXattrFixture(vfsCapabilityRevision2, 1, 2, false, 0)
+	revision3 := capabilityXattrFixture(vfsCapabilityRevision3, 1, 2, false, 3)
+	unknown := make([]byte, vfsCapabilityRevision2Size)
+	binary.LittleEndian.PutUint32(unknown[:4], 0x04000000)
+	tests := []struct {
+		name string
+		data []byte
+		want string
+	}{
+		{"truncated revision 2", revision2[:len(revision2)-1], "has length 19, want 20"},
+		{"truncated revision 3", revision3[:len(revision3)-1], "has length 23, want 24"},
+		{"empty", nil, "truncated"},
+		{"short magic", []byte{1, 2, 3}, "truncated"},
+		{"unknown revision", unknown, "unsupported security.capability revision"},
+		{"overlong revision 2", append(revision2, 0), "has length 21, want 20"},
+		{"overlong revision 3", append(revision3, 0), "has length 25, want 24"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := decodeFileCapabilities(tt.data); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want containing %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestFileCapabilityInspectionError(t *testing.T) {
+	absent := fileCapabilityInspectionError(unix.ENODATA)
+	if !absent.Known || absent.Present || absent.Err != nil {
+		t.Fatalf("ENODATA classification = %#v", absent)
+	}
+	failed := fileCapabilityInspectionError(unix.EPERM)
+	if failed.Known || failed.Present || failed.Err == nil {
+		t.Fatalf("EPERM classification = %#v", failed)
+	}
+}
+
+func TestParseRequiredCapabilities(t *testing.T) {
+	highMask := uint64(1) << unix.CAP_BPF
+	tests := []struct {
+		name        string
+		input       []string
+		wantNames   []string
+		wantMask    uint64
+		wantUnknown []string
+		wantKnown   bool
+	}{
+		{"canonical", []string{"CAP_SETUID"}, []string{"CAP_SETUID"}, uint64(1) << unix.CAP_SETUID, nil, true},
+		{"lowercase", []string{"cap_setuid"}, []string{"CAP_SETUID"}, uint64(1) << unix.CAP_SETUID, nil, true},
+		{"mixed case", []string{"Cap_Setuid"}, []string{"CAP_SETUID"}, uint64(1) << unix.CAP_SETUID, nil, true},
+		{"modern high bit", []string{"CAP_BPF"}, []string{"CAP_BPF"}, highMask, nil, true},
+		{"multiple", []string{"CAP_SETUID", "CAP_CHOWN"}, []string{"CAP_CHOWN", "CAP_SETUID"}, 1 | uint64(1)<<unix.CAP_SETUID, nil, true},
+		{"duplicates", []string{"CAP_SETUID", "cap_setuid"}, []string{"CAP_SETUID"}, uint64(1) << unix.CAP_SETUID, nil, true},
+		{"unknown", []string{"CAP_FIXTURE"}, nil, 0, []string{"CAP_FIXTURE"}, false},
+		{"known and unknown", []string{"CAP_SETUID", "CAP_FIXTURE"}, []string{"CAP_SETUID"}, uint64(1) << unix.CAP_SETUID, []string{"CAP_FIXTURE"}, false},
+		{"empty", []string{}, nil, 0, nil, false},
+		{"nil", nil, nil, 0, nil, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseRequiredCapabilities(tt.input)
+			if !reflect.DeepEqual(got.Names, tt.wantNames) || got.Mask != tt.wantMask || !reflect.DeepEqual(got.Unknown, tt.wantUnknown) || got.Known != tt.wantKnown {
+				t.Fatalf("parseRequiredCapabilities(%v) = %#v", tt.input, got)
+			}
+		})
+	}
+}
+
+func TestLinuxCapabilityMapIsComplete(t *testing.T) {
+	if len(linuxCapabilityBits) != int(unix.CAP_LAST_CAP)+1 {
+		t.Fatalf("capability map has %d entries, want %d", len(linuxCapabilityBits), int(unix.CAP_LAST_CAP)+1)
+	}
+	seen := make(map[uint]string)
+	for name, bit := range linuxCapabilityBits {
+		if previous, duplicate := seen[bit]; duplicate {
+			t.Fatalf("capability bit %d is mapped by %q and %q", bit, previous, name)
+		}
+		seen[bit] = name
+	}
+	for bit := uint(0); bit <= uint(unix.CAP_LAST_CAP); bit++ {
+		if _, ok := seen[bit]; !ok {
+			t.Fatalf("capability bit %d is missing", bit)
+		}
+	}
+	if bit := linuxCapabilityBits["CAP_CHECKPOINT_RESTORE"]; bit <= 31 || uint64(1)<<bit == 0 {
+		t.Fatalf("high capability bit = %d", bit)
+	}
+}
+
+func validCapabilityEvaluationInput() capabilityEvaluationInput {
+	required := parseRequiredCapabilities([]string{"CAP_SETUID", "CAP_BPF"})
+	return capabilityEvaluationInput{
+		FileInspected:    true,
+		Regular:          true,
+		Executable:       true,
+		Mount:            mountStatus{Known: true},
+		NoNewPrivsKnown:  true,
+		CapBndKnown:      true,
+		CapBnd:           required.Mask,
+		Required:         required,
+		Xattr:            fileCapabilityInspection{Known: true, Present: true, Capabilities: fileCapabilities{Permitted: required.Mask, Effective: true}},
+		RequireEffective: true,
+	}
+}
+
+func TestEvaluateCapabilities(t *testing.T) {
+	unsupportedData := make([]byte, vfsCapabilityRevision2Size)
+	binary.LittleEndian.PutUint32(unsupportedData[:4], 0x04000000)
+	_, unsupportedErr := decodeFileCapabilities(unsupportedData)
+	truncated := capabilityXattrFixture(vfsCapabilityRevision2, 1, 0, false, 0)[:10]
+	_, truncatedErr := decodeFileCapabilities(truncated)
+
+	tests := []struct {
+		name     string
+		change   func(*capabilityEvaluationInput)
+		want     applicabilityState
+		evidence string
+	}{
+		{"fully satisfied", func(*capabilityEvaluationInput) {}, stateConfirmed, ""},
+		{"required permitted bit absent", func(input *capabilityEvaluationInput) {
+			input.Xattr.Capabilities.Permitted &^= uint64(1) << unix.CAP_SETUID
+		}, stateUnavailable, "CAP_SETUID is missing from file permitted set"},
+		{"multiple required one absent", func(input *capabilityEvaluationInput) {
+			input.Required = parseRequiredCapabilities([]string{"CAP_CHOWN", "CAP_SETUID", "CAP_BPF"})
+			input.CapBnd = input.Required.Mask
+		}, stateUnavailable, "CAP_CHOWN is missing from file permitted set"},
+		{"effective required and absent", func(input *capabilityEvaluationInput) { input.Xattr.Capabilities.Effective = false }, stateUnavailable, "effective flag is not set"},
+		{"effective not required", func(input *capabilityEvaluationInput) {
+			input.RequireEffective = false
+			input.Xattr.Capabilities.Effective = false
+		}, stateConfirmed, ""},
+		{"CapBnd excludes required bit", func(input *capabilityEvaluationInput) { input.CapBnd &^= uint64(1) << unix.CAP_BPF }, stateUnavailable, "CAP_BPF is excluded by CapBnd"},
+		{"CapBnd unknown", func(input *capabilityEvaluationInput) { input.CapBndKnown = false }, stateUnknown, "CapBnd could not be determined"},
+		{"empty requirement", func(input *capabilityEvaluationInput) { input.Required = parseRequiredCapabilities(nil) }, stateUnknown, "required capability list is empty"},
+		{"unknown capability", func(input *capabilityEvaluationInput) {
+			input.Required = parseRequiredCapabilities([]string{"CAP_SETUID", "CAP_FIXTURE"})
+			input.CapBnd = input.Required.Mask
+		}, stateUnknown, "unknown required capability CAP_FIXTURE"},
+		{"xattr absent", func(input *capabilityEvaluationInput) { input.Xattr = fileCapabilityInspection{Known: true} }, stateUnavailable, "security.capability is not present"},
+		{"xattr inspection failed", func(input *capabilityEvaluationInput) {
+			input.Xattr = fileCapabilityInspection{Err: errors.New("permission denied")}
+		}, stateUnknown, "permission denied"},
+		{"unsupported xattr format", func(input *capabilityEvaluationInput) {
+			input.Xattr = fileCapabilityInspection{Present: true, Err: unsupportedErr}
+		}, stateUnknown, "unsupported security.capability revision"},
+		{"truncated xattr", func(input *capabilityEvaluationInput) {
+			input.Xattr = fileCapabilityInspection{Present: true, Err: truncatedErr}
+		}, stateUnknown, "has length 10, want 20"},
+		{"nosuid", func(input *capabilityEvaluationInput) { input.Mount.NoSUID = true }, stateUnavailable, "mounted nosuid"},
+		{"noexec", func(input *capabilityEvaluationInput) { input.Mount.NoExec = true }, stateUnavailable, "mounted noexec"},
+		{"NoNewPrivs enabled", func(input *capabilityEvaluationInput) { input.NoNewPrivs = true }, stateUnavailable, "NoNewPrivs is enabled"},
+		{"NoNewPrivs unknown", func(input *capabilityEvaluationInput) { input.NoNewPrivsKnown = false }, stateUnknown, "NoNewPrivs could not be determined"},
+		{"mount unknown", func(input *capabilityEvaluationInput) { input.Mount.Known = false }, stateUnknown, "mount flags could not be determined"},
+		{"version restriction", func(input *capabilityEvaluationInput) { input.Version = "fixture <= 1" }, stateUnknown, "version restriction was not verified"},
+		{"missing bit outranks version", func(input *capabilityEvaluationInput) {
+			input.Xattr.Capabilities.Permitted &^= uint64(1) << unix.CAP_SETUID
+			input.Version = "fixture <= 1"
+		}, stateUnavailable, "CAP_SETUID is missing from file permitted set"},
+		{"bounding exclusion outranks unknown xattr", func(input *capabilityEvaluationInput) {
+			input.CapBnd &^= uint64(1) << unix.CAP_BPF
+			input.Xattr = fileCapabilityInspection{Err: errors.New("inspection unavailable")}
+		}, stateUnavailable, "CAP_BPF is excluded by CapBnd"},
+		{"file inspection unknown", func(input *capabilityEvaluationInput) { input.FileInspected = false }, stateUnknown, "file information could not be determined"},
+		{"non-regular target", func(input *capabilityEvaluationInput) { input.Regular = false }, stateUnavailable, "not a regular file"},
+		{"non-executable target", func(input *capabilityEvaluationInput) { input.Executable = false }, stateUnavailable, "not executable"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := validCapabilityEvaluationInput()
+			tt.change(&input)
+			got := evaluateCapabilities(input)
+			if got.State != tt.want {
+				t.Fatalf("state = %q, want %q; evidence %v", got.State, tt.want, got.Evidence)
+			}
+			if tt.want == stateConfirmed && len(got.Evidence) != 0 {
+				t.Fatalf("confirmed result has evidence %v", got.Evidence)
+			}
+			if tt.want != stateConfirmed && (len(got.Evidence) == 0 || !warningContains(got.Evidence, tt.evidence)) {
+				t.Fatalf("evidence = %v, want containing %q", got.Evidence, tt.evidence)
+			}
+			if again := evaluateCapabilities(input); !reflect.DeepEqual(got, again) {
+				t.Fatalf("evidence order changed: first %v, second %v", got.Evidence, again.Evidence)
+			}
+		})
+	}
 }
 
 func TestFetchCatalogSuccessUsesGET(t *testing.T) {

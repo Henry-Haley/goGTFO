@@ -4,6 +4,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -22,6 +24,122 @@ var (
 	errCatalogNameNotFound  = errors.New("catalog executable name not found")
 	errCatalogNameAmbiguous = errors.New("catalog executable name is ambiguous")
 )
+
+type applicabilityState string
+
+const (
+	stateConfirmed   applicabilityState = "confirmed"
+	statePotential   applicabilityState = "potential"
+	stateUnknown     applicabilityState = "unknown"
+	stateUnavailable applicabilityState = "unavailable"
+
+	securityCapabilityXattr           = "security.capability"
+	vfsCapabilityRevisionMask  uint32 = 0xff000000
+	vfsCapabilityRevision2     uint32 = 0x02000000
+	vfsCapabilityRevision3     uint32 = 0x03000000
+	vfsCapabilityEffective     uint32 = 0x00000001
+	vfsCapabilityRevision2Size        = 20
+	vfsCapabilityRevision3Size        = 24
+)
+
+type applicabilityResult struct {
+	State    applicabilityState
+	Evidence []string
+}
+
+type suidEvaluationInput struct {
+	FileInspected   bool
+	Regular         bool
+	Mode            os.FileMode
+	OwnerUIDKnown   bool
+	OwnerUID        uint32
+	Mount           mountStatus
+	NoNewPrivsKnown bool
+	NoNewPrivs      bool
+	Version         string
+}
+
+type fileCapabilities struct {
+	Revision    uint32
+	Permitted   uint64
+	Inheritable uint64
+	Effective   bool
+	RootID      uint32
+	HasRootID   bool
+}
+
+type fileCapabilityInspection struct {
+	Known        bool
+	Present      bool
+	Capabilities fileCapabilities
+	Err          error
+}
+
+type requiredCapabilities struct {
+	Names   []string
+	Mask    uint64
+	Unknown []string
+	Known   bool
+}
+
+type capabilityEvaluationInput struct {
+	FileInspected    bool
+	Regular          bool
+	Executable       bool
+	Mount            mountStatus
+	NoNewPrivsKnown  bool
+	NoNewPrivs       bool
+	CapBndKnown      bool
+	CapBnd           uint64
+	Required         requiredCapabilities
+	Xattr            fileCapabilityInspection
+	RequireEffective bool
+	Version          string
+}
+
+var linuxCapabilityBits = map[string]uint{
+	"CAP_CHOWN":              unix.CAP_CHOWN,
+	"CAP_DAC_OVERRIDE":       unix.CAP_DAC_OVERRIDE,
+	"CAP_DAC_READ_SEARCH":    unix.CAP_DAC_READ_SEARCH,
+	"CAP_FOWNER":             unix.CAP_FOWNER,
+	"CAP_FSETID":             unix.CAP_FSETID,
+	"CAP_KILL":               unix.CAP_KILL,
+	"CAP_SETGID":             unix.CAP_SETGID,
+	"CAP_SETUID":             unix.CAP_SETUID,
+	"CAP_SETPCAP":            unix.CAP_SETPCAP,
+	"CAP_LINUX_IMMUTABLE":    unix.CAP_LINUX_IMMUTABLE,
+	"CAP_NET_BIND_SERVICE":   unix.CAP_NET_BIND_SERVICE,
+	"CAP_NET_BROADCAST":      unix.CAP_NET_BROADCAST,
+	"CAP_NET_ADMIN":          unix.CAP_NET_ADMIN,
+	"CAP_NET_RAW":            unix.CAP_NET_RAW,
+	"CAP_IPC_LOCK":           unix.CAP_IPC_LOCK,
+	"CAP_IPC_OWNER":          unix.CAP_IPC_OWNER,
+	"CAP_SYS_MODULE":         unix.CAP_SYS_MODULE,
+	"CAP_SYS_RAWIO":          unix.CAP_SYS_RAWIO,
+	"CAP_SYS_CHROOT":         unix.CAP_SYS_CHROOT,
+	"CAP_SYS_PTRACE":         unix.CAP_SYS_PTRACE,
+	"CAP_SYS_PACCT":          unix.CAP_SYS_PACCT,
+	"CAP_SYS_ADMIN":          unix.CAP_SYS_ADMIN,
+	"CAP_SYS_BOOT":           unix.CAP_SYS_BOOT,
+	"CAP_SYS_NICE":           unix.CAP_SYS_NICE,
+	"CAP_SYS_RESOURCE":       unix.CAP_SYS_RESOURCE,
+	"CAP_SYS_TIME":           unix.CAP_SYS_TIME,
+	"CAP_SYS_TTY_CONFIG":     unix.CAP_SYS_TTY_CONFIG,
+	"CAP_MKNOD":              unix.CAP_MKNOD,
+	"CAP_LEASE":              unix.CAP_LEASE,
+	"CAP_AUDIT_WRITE":        unix.CAP_AUDIT_WRITE,
+	"CAP_AUDIT_CONTROL":      unix.CAP_AUDIT_CONTROL,
+	"CAP_SETFCAP":            unix.CAP_SETFCAP,
+	"CAP_MAC_OVERRIDE":       unix.CAP_MAC_OVERRIDE,
+	"CAP_MAC_ADMIN":          unix.CAP_MAC_ADMIN,
+	"CAP_SYSLOG":             unix.CAP_SYSLOG,
+	"CAP_WAKE_ALARM":         unix.CAP_WAKE_ALARM,
+	"CAP_BLOCK_SUSPEND":      unix.CAP_BLOCK_SUSPEND,
+	"CAP_AUDIT_READ":         unix.CAP_AUDIT_READ,
+	"CAP_PERFMON":            unix.CAP_PERFMON,
+	"CAP_BPF":                unix.CAP_BPF,
+	"CAP_CHECKPOINT_RESTORE": unix.CAP_CHECKPOINT_RESTORE,
+}
 
 type procStatus struct {
 	NoNewPrivs      bool
@@ -254,4 +372,283 @@ func interpretMountFlags(flags int64) mountStatus {
 
 func discoveryUsable(executable bool, mount mountStatus) bool {
 	return executable && mount.Known && !mount.NoExec
+}
+
+func composeApplicability(states ...applicabilityState) applicabilityState {
+	if len(states) == 0 {
+		return stateUnknown
+	}
+
+	result := stateConfirmed
+	for _, state := range states {
+		switch state {
+		case stateUnavailable:
+			return stateUnavailable
+		case stateUnknown:
+			result = stateUnknown
+		case statePotential:
+			if result == stateConfirmed {
+				result = statePotential
+			}
+		case stateConfirmed:
+		default:
+			result = stateUnknown
+		}
+	}
+	return result
+}
+
+func canonicalOwnerUID(info os.FileInfo) (uint32, bool) {
+	if info == nil {
+		return 0, false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat == nil {
+		return 0, false
+	}
+	return stat.Uid, true
+}
+
+func evaluateSUID(input suidEvaluationInput) applicabilityResult {
+	states := []applicabilityState{stateConfirmed}
+	var evidence []string
+
+	if !input.FileInspected {
+		states = append(states, stateUnknown)
+		evidence = append(evidence, "canonical target file information could not be determined")
+	} else {
+		if !input.Regular {
+			states = append(states, stateUnavailable)
+			evidence = append(evidence, "canonical target is not a regular file")
+		}
+		if input.Mode&os.ModeSetuid == 0 {
+			states = append(states, stateUnavailable)
+			evidence = append(evidence, "canonical target does not have setuid bit")
+		}
+	}
+
+	if !input.OwnerUIDKnown {
+		states = append(states, stateUnknown)
+		evidence = append(evidence, "canonical target owner UID could not be determined")
+	} else if input.OwnerUID != 0 {
+		states = append(states, stateUnavailable)
+		evidence = append(evidence, fmt.Sprintf("canonical target owner UID is %d, expected 0", input.OwnerUID))
+	}
+
+	if !input.Mount.Known {
+		states = append(states, stateUnknown)
+		evidence = append(evidence, "filesystem mount flags could not be determined")
+	} else {
+		if input.Mount.NoSUID {
+			states = append(states, stateUnavailable)
+			evidence = append(evidence, "filesystem is mounted nosuid")
+		}
+		if input.Mount.NoExec {
+			states = append(states, stateUnavailable)
+			evidence = append(evidence, "filesystem is mounted noexec")
+		}
+	}
+
+	if !input.NoNewPrivsKnown {
+		states = append(states, stateUnknown)
+		evidence = append(evidence, "NoNewPrivs could not be determined")
+	} else if input.NoNewPrivs {
+		states = append(states, stateUnavailable)
+		evidence = append(evidence, "NoNewPrivs is enabled")
+	}
+
+	if input.Version != "" {
+		states = append(states, stateUnknown)
+		evidence = append(evidence, "version restriction was not verified: "+input.Version)
+	}
+
+	return applicabilityResult{State: composeApplicability(states...), Evidence: evidence}
+}
+
+func decodeFileCapabilities(data []byte) (fileCapabilities, error) {
+	if len(data) < 4 {
+		return fileCapabilities{}, fmt.Errorf("security.capability is truncated: length %d", len(data))
+	}
+
+	magic := binary.LittleEndian.Uint32(data[:4])
+	revision := magic & vfsCapabilityRevisionMask
+	wantLength := 0
+	switch revision {
+	case vfsCapabilityRevision2:
+		wantLength = vfsCapabilityRevision2Size
+	case vfsCapabilityRevision3:
+		wantLength = vfsCapabilityRevision3Size
+	default:
+		return fileCapabilities{}, fmt.Errorf("unsupported security.capability revision 0x%08x", revision)
+	}
+	if len(data) != wantLength {
+		return fileCapabilities{}, fmt.Errorf("security.capability revision 0x%08x has length %d, want %d", revision, len(data), wantLength)
+	}
+
+	capabilities := fileCapabilities{
+		Revision:    revision,
+		Permitted:   uint64(binary.LittleEndian.Uint32(data[4:8])) | uint64(binary.LittleEndian.Uint32(data[12:16]))<<32,
+		Inheritable: uint64(binary.LittleEndian.Uint32(data[8:12])) | uint64(binary.LittleEndian.Uint32(data[16:20]))<<32,
+		Effective:   magic&vfsCapabilityEffective != 0,
+	}
+	if revision == vfsCapabilityRevision3 {
+		capabilities.RootID = binary.LittleEndian.Uint32(data[20:24])
+		capabilities.HasRootID = true
+	}
+	return capabilities, nil
+}
+
+func inspectFileCapabilities(path string) fileCapabilityInspection {
+	for range 2 {
+		size, err := unix.Getxattr(path, securityCapabilityXattr, nil)
+		if err != nil {
+			return fileCapabilityInspectionError(err)
+		}
+
+		data := make([]byte, size)
+		read, err := unix.Getxattr(path, securityCapabilityXattr, data)
+		if errors.Is(err, unix.ERANGE) {
+			continue
+		}
+		if err != nil {
+			return fileCapabilityInspectionError(err)
+		}
+		if read < 0 || read > len(data) {
+			return fileCapabilityInspection{Present: true, Err: fmt.Errorf("read security.capability: invalid length %d", read)}
+		}
+
+		capabilities, err := decodeFileCapabilities(data[:read])
+		if err != nil {
+			return fileCapabilityInspection{Present: true, Err: err}
+		}
+		return fileCapabilityInspection{Known: true, Present: true, Capabilities: capabilities}
+	}
+	return fileCapabilityInspection{Present: true, Err: errors.New("security.capability changed while reading")}
+}
+
+func fileCapabilityInspectionError(err error) fileCapabilityInspection {
+	if errors.Is(err, unix.ENODATA) {
+		return fileCapabilityInspection{Known: true}
+	}
+	return fileCapabilityInspection{Err: fmt.Errorf("inspect security.capability: %w", err)}
+}
+
+func parseRequiredCapabilities(names []string) requiredCapabilities {
+	var result requiredCapabilities
+	unknown := make(map[string]bool)
+	for _, name := range names {
+		canonical := strings.ToUpper(name)
+		bit, ok := linuxCapabilityBits[canonical]
+		if !ok {
+			unknown[name] = true
+			continue
+		}
+		result.Mask |= uint64(1) << bit
+	}
+	result.Names = capabilityNamesForMask(result.Mask)
+	result.Unknown = slices.Sorted(maps.Keys(unknown))
+	result.Known = len(result.Names) > 0 && len(result.Unknown) == 0
+	return result
+}
+
+func capabilityNamesForMask(mask uint64) []string {
+	var names []string
+	for name, bit := range linuxCapabilityBits {
+		if mask&(uint64(1)<<bit) != 0 {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	return names
+}
+
+func evaluateCapabilities(input capabilityEvaluationInput) applicabilityResult {
+	states := []applicabilityState{stateConfirmed}
+	var evidence []string
+
+	if !input.FileInspected {
+		states = append(states, stateUnknown)
+		evidence = append(evidence, "canonical target file information could not be determined")
+	} else {
+		if !input.Regular {
+			states = append(states, stateUnavailable)
+			evidence = append(evidence, "canonical target is not a regular file")
+		}
+		if !input.Executable {
+			states = append(states, stateUnavailable)
+			evidence = append(evidence, "canonical target is not executable")
+		}
+	}
+
+	if !input.Mount.Known {
+		states = append(states, stateUnknown)
+		evidence = append(evidence, "filesystem mount flags could not be determined")
+	} else {
+		if input.Mount.NoSUID {
+			states = append(states, stateUnavailable)
+			evidence = append(evidence, "filesystem is mounted nosuid")
+		}
+		if input.Mount.NoExec {
+			states = append(states, stateUnavailable)
+			evidence = append(evidence, "filesystem is mounted noexec")
+		}
+	}
+
+	if !input.NoNewPrivsKnown {
+		states = append(states, stateUnknown)
+		evidence = append(evidence, "NoNewPrivs could not be determined")
+	} else if input.NoNewPrivs {
+		states = append(states, stateUnavailable)
+		evidence = append(evidence, "NoNewPrivs is enabled")
+	}
+
+	if !input.Required.Known {
+		states = append(states, stateUnknown)
+		if len(input.Required.Names) == 0 && len(input.Required.Unknown) == 0 {
+			evidence = append(evidence, "required capability list is empty")
+		}
+		for _, name := range input.Required.Unknown {
+			evidence = append(evidence, "unknown required capability "+name)
+		}
+	}
+
+	if !input.Xattr.Known {
+		states = append(states, stateUnknown)
+		message := "security.capability could not be inspected"
+		if input.Xattr.Err != nil {
+			message += ": " + input.Xattr.Err.Error()
+		}
+		evidence = append(evidence, message)
+	} else if !input.Xattr.Present {
+		states = append(states, stateUnavailable)
+		evidence = append(evidence, "security.capability is not present")
+	} else {
+		missing := input.Required.Mask &^ input.Xattr.Capabilities.Permitted
+		for _, name := range capabilityNamesForMask(missing) {
+			states = append(states, stateUnavailable)
+			evidence = append(evidence, "required capability "+name+" is missing from file permitted set")
+		}
+		if input.RequireEffective && !input.Xattr.Capabilities.Effective {
+			states = append(states, stateUnavailable)
+			evidence = append(evidence, "file capability effective flag is not set")
+		}
+	}
+
+	if !input.CapBndKnown {
+		states = append(states, stateUnknown)
+		evidence = append(evidence, "CapBnd could not be determined")
+	} else {
+		missing := input.Required.Mask &^ input.CapBnd
+		for _, name := range capabilityNamesForMask(missing) {
+			states = append(states, stateUnavailable)
+			evidence = append(evidence, "required capability "+name+" is excluded by CapBnd")
+		}
+	}
+
+	if input.Version != "" {
+		states = append(states, stateUnknown)
+		evidence = append(evidence, "version restriction was not verified: "+input.Version)
+	}
+
+	return applicabilityResult{State: composeApplicability(states...), Evidence: evidence}
 }
