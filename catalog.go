@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -72,6 +74,69 @@ type companionMeta struct {
 type companionDef struct {
 	Reference string
 	Inline    *companionMeta
+}
+
+type resolutionResult struct {
+	Findings []finding
+	Warnings []string
+}
+
+type finding struct {
+	Name       string
+	AliasChain []string
+	Comment    string
+	Techniques []technique
+	Warnings   []string
+}
+
+type technique struct {
+	TargetExecutable string
+	FunctionKey      string
+	FunctionLabel    string
+	Description      string
+	MitreIDs         []string
+	ContextKey       string
+	ContextLabel     string
+	Code             string
+	ExampleComment   string
+	ContextComment   string
+	Version          string
+	ContextShell     string
+	ContextList      []string
+	Blind            *bool
+	TTY              *bool
+	Binary           *bool
+	Companions       []companionCommand
+	InheritanceChain []string
+	Launchers        []launcherStep
+	Warnings         []string
+}
+
+type companionCommand struct {
+	Role    string
+	Comment string
+	Code    string
+}
+
+type launcherStep struct {
+	Executable     string
+	ContextKey     string
+	Code           string
+	ExampleComment string
+	ContextComment string
+	Version        string
+	ContextShell   string
+	ContextList    []string
+	Blind          *bool
+	TTY            *bool
+	Binary         *bool
+}
+
+type resolvedContext struct {
+	Code    string
+	Comment string
+	Shell   string
+	List    []string
 }
 
 func decodeCatalog(r io.Reader) (catalog, error) {
@@ -206,4 +271,284 @@ func decodeCompanion(raw json.RawMessage) (companionDef, error) {
 	default:
 		return companionDef{}, fmt.Errorf("companion value must be a string reference or an object")
 	}
+}
+
+func resolveCatalog(c catalog) resolutionResult {
+	var result resolutionResult
+	for _, name := range slices.Sorted(maps.Keys(c.Executables)) {
+		f := finding{Name: name}
+		targetName, target, aliasChain, err := resolveAlias(c, name)
+		if err != nil {
+			f.Warnings = []string{fmt.Sprintf("catalog executable %q: %v", name, err)}
+			result.Findings = append(result.Findings, f)
+			result.Warnings = append(result.Warnings, f.Warnings...)
+			continue
+		}
+
+		if len(aliasChain) > 1 {
+			f.AliasChain = aliasChain
+		}
+		f.Comment = target.Comment
+		f.Techniques, f.Warnings = resolveExecutable(c, name, targetName, target, map[string]bool{})
+		f.Techniques = deduplicateTechniques(name, f.Techniques)
+		f.Warnings = sortedUniqueStrings(f.Warnings)
+		result.Findings = append(result.Findings, f)
+		result.Warnings = append(result.Warnings, f.Warnings...)
+		for _, technique := range f.Techniques {
+			result.Warnings = append(result.Warnings, technique.Warnings...)
+		}
+	}
+	result.Warnings = sortedUniqueStrings(result.Warnings)
+	return result
+}
+
+func resolveAlias(c catalog, name string) (string, executableDef, []string, error) {
+	visited := make(map[string]bool)
+	var chain []string
+	for current := name; ; {
+		if visited[current] {
+			return "", executableDef{}, chain, fmt.Errorf("alias cycle reaches %q", current)
+		}
+		entry, ok := c.Executables[current]
+		if !ok {
+			return "", executableDef{}, chain, fmt.Errorf("alias target %q is missing", current)
+		}
+		visited[current] = true
+		chain = append(chain, current)
+		if entry.Alias == "" {
+			return current, entry, chain, nil
+		}
+		current = entry.Alias
+	}
+}
+
+func resolveExecutable(c catalog, originalName, executableName string, entry executableDef, visited map[string]bool) ([]technique, []string) {
+	var techniques []technique
+	var warnings []string
+
+	for _, functionKey := range slices.Sorted(maps.Keys(entry.Functions)) {
+		if functionKey == "inherit" {
+			continue
+		}
+		for _, example := range entry.Functions[functionKey] {
+			for _, contextKey := range slices.Sorted(maps.Keys(example.Contexts)) {
+				value, err := normalizeTechnique(c, originalName, executableName, functionKey, contextKey, example)
+				if err != nil {
+					warnings = append(warnings, fmt.Sprintf("catalog executable %q function %q context %q: %v", originalName, functionKey, contextKey, err))
+					continue
+				}
+				techniques = append(techniques, value)
+			}
+		}
+	}
+
+	inheritExamples := entry.Functions["inherit"]
+	if len(inheritExamples) == 0 {
+		return techniques, warnings
+	}
+
+	visitKey := executableName + "\x00inherit"
+	if visited[visitKey] {
+		return techniques, append(warnings, fmt.Sprintf("catalog executable %q: inheritance cycle at executable %q function %q", originalName, executableName, "inherit"))
+	}
+	visited[visitKey] = true
+	defer delete(visited, visitKey)
+
+	for _, example := range inheritExamples {
+		if example.From == "" {
+			warnings = append(warnings, fmt.Sprintf("catalog executable %q function %q in %q has an empty inheritance source", originalName, "inherit", executableName))
+			continue
+		}
+
+		targetName, target, aliasChain, err := resolveAlias(c, example.From)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("catalog executable %q function %q in %q cannot resolve source %q: %v", originalName, "inherit", executableName, example.From, err))
+			continue
+		}
+
+		launchers := make(map[string]launcherStep)
+		for _, contextKey := range slices.Sorted(maps.Keys(example.Contexts)) {
+			context, err := resolveExampleContext(example, example.Contexts[contextKey])
+			if err != nil {
+				warnings = append(warnings, fmt.Sprintf("catalog executable %q function %q context %q in %q: %v", originalName, "inherit", contextKey, executableName, err))
+				continue
+			}
+			launchers[contextKey] = launcherStep{
+				Executable:     executableName,
+				ContextKey:     contextKey,
+				Code:           context.Code,
+				ExampleComment: example.Comment,
+				ContextComment: context.Comment,
+				Version:        example.Version,
+				ContextShell:   context.Shell,
+				ContextList:    append([]string(nil), context.List...),
+				Blind:          example.Blind,
+				TTY:            example.TTY,
+				Binary:         example.Binary,
+			}
+		}
+
+		targetTechniques, targetWarnings := resolveExecutable(c, originalName, targetName, target, visited)
+		warnings = append(warnings, targetWarnings...)
+		for _, targetTechnique := range targetTechniques {
+			launcher, ok := launchers[targetTechnique.ContextKey]
+			if !ok {
+				continue
+			}
+
+			resolved := targetTechnique
+			resolved.Launchers = append([]launcherStep{launcher}, targetTechnique.Launchers...)
+			chain := targetTechnique.InheritanceChain
+			if len(chain) == 0 {
+				chain = []string{targetTechnique.TargetExecutable}
+			}
+			if len(aliasChain) > 1 {
+				chain = append(append([]string(nil), aliasChain[:len(aliasChain)-1]...), chain...)
+			}
+			resolved.InheritanceChain = append([]string{executableName}, chain...)
+			techniques = append(techniques, resolved)
+		}
+	}
+
+	return techniques, warnings
+}
+
+func normalizeTechnique(c catalog, originalName, executableName, functionKey, contextKey string, example exampleDef) (technique, error) {
+	context, err := resolveExampleContext(example, example.Contexts[contextKey])
+	if err != nil {
+		return technique{}, err
+	}
+
+	function := c.Functions[functionKey]
+	functionLabel := function.Label
+	if strings.TrimSpace(functionLabel) == "" {
+		functionLabel = functionKey
+	}
+	contextMeta := c.Contexts[contextKey]
+	contextLabel := contextMeta.Label
+	if strings.TrimSpace(contextLabel) == "" {
+		contextLabel = contextKey
+	}
+
+	companions, warnings := resolveCompanions(function, example, originalName, functionKey, contextKey)
+	return technique{
+		TargetExecutable: executableName,
+		FunctionKey:      functionKey,
+		FunctionLabel:    functionLabel,
+		Description:      function.Description,
+		MitreIDs:         append([]string(nil), function.Mitre...),
+		ContextKey:       contextKey,
+		ContextLabel:     contextLabel,
+		Code:             context.Code,
+		ExampleComment:   example.Comment,
+		ContextComment:   context.Comment,
+		Version:          example.Version,
+		ContextShell:     context.Shell,
+		ContextList:      append([]string(nil), context.List...),
+		Blind:            example.Blind,
+		TTY:              example.TTY,
+		Binary:           example.Binary,
+		Companions:       companions,
+		Warnings:         warnings,
+	}, nil
+}
+
+func resolveExampleContext(example exampleDef, raw json.RawMessage) (resolvedContext, error) {
+	result := resolvedContext{Code: example.Code}
+	context, err := decodeContext(raw)
+	if err != nil {
+		return resolvedContext{}, err
+	}
+	if context == nil {
+		return result, nil
+	}
+	if context.Code != "" {
+		result.Code = context.Code
+	}
+	result.Comment = context.Comment
+	result.Shell = context.Shell
+	result.List = append([]string(nil), context.List...)
+	return result, nil
+}
+
+func resolveCompanions(function functionMeta, example exampleDef, executableName, functionKey, contextKey string) ([]companionCommand, []string) {
+	roles := []struct {
+		name string
+		raw  json.RawMessage
+	}{
+		{"listener", example.Listener},
+		{"connector", example.Connector},
+		{"sender", example.Sender},
+		{"receiver", example.Receiver},
+	}
+
+	var companions []companionCommand
+	var warnings []string
+	for _, role := range roles {
+		if len(bytes.TrimSpace(role.raw)) == 0 {
+			continue
+		}
+
+		definition, err := decodeCompanion(role.raw)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("catalog executable %q function %q context %q has malformed %s companion: %v", executableName, functionKey, contextKey, role.name, err))
+			continue
+		}
+
+		var value *companionMeta
+		if definition.Reference != "" {
+			raw, ok := function.Extra[definition.Reference]
+			if !ok {
+				warnings = append(warnings, fmt.Sprintf("catalog executable %q function %q context %q companion %s reference %q is missing", executableName, functionKey, contextKey, role.name, definition.Reference))
+				continue
+			}
+			referenced, err := decodeCompanion(raw)
+			if err != nil || referenced.Inline == nil {
+				warnings = append(warnings, fmt.Sprintf("catalog executable %q function %q context %q companion %s reference %q is malformed", executableName, functionKey, contextKey, role.name, definition.Reference))
+				continue
+			}
+			value = referenced.Inline
+		} else {
+			value = definition.Inline
+		}
+		if value == nil {
+			warnings = append(warnings, fmt.Sprintf("catalog executable %q function %q context %q has malformed %s companion", executableName, functionKey, contextKey, role.name))
+			continue
+		}
+		companions = append(companions, companionCommand{Role: role.name, Comment: value.Comment, Code: value.Code})
+	}
+	return companions, warnings
+}
+
+func deduplicateTechniques(name string, techniques []technique) []technique {
+	type identity struct {
+		name        string
+		functionKey string
+		contextKey  string
+		code        string
+		inheritance string
+	}
+
+	seen := make(map[identity]bool)
+	result := make([]technique, 0, len(techniques))
+	for _, technique := range techniques {
+		key := identity{
+			name:        name,
+			functionKey: technique.FunctionKey,
+			contextKey:  technique.ContextKey,
+			code:        technique.Code,
+			inheritance: strings.Join(technique.InheritanceChain, "\x00"),
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		result = append(result, technique)
+	}
+	return result
+}
+
+func sortedUniqueStrings(values []string) []string {
+	slices.Sort(values)
+	return slices.Compact(values)
 }
