@@ -65,7 +65,7 @@ Normal listings show `confirmed` and `potential` contexts, plus counts for hidde
 
 The Linux checks include executable and mount state, `noexec`, `nosuid`, `NoNewPrivs`, the process capability bounding set, root-owned SUID files, and file capabilities. These checks deliberately avoid overstating what can be proven from local metadata. Sudo trust is accepted only in the initial user namespace; mount namespaces and a privileged attacker who can replace files after validation remain outside the ordinary unprivileged PATH-poisoning threat model. goGTFO does not claim to detect whether a future target execution will be ptraced: `/proc/self/status` describes the scanner process, while the kernel's set-user-ID and file-capability suppression applies to the process being executed.
 
-Sudo is disabled by default. With `-check-sudo`, a recognized canonical executable path is still only `potential`: a path-policy listing cannot prove authorization for an entire GTFOBins command line. A failed or unavailable sudo probe remains `unknown`, rather than becoming `confirmed` or `unavailable` based solely on path policy.
+Sudo is disabled by default. With `-check-sudo`, a recognized canonical executable path is still only `potential`: a path-policy listing cannot prove authorization for an entire GTFOBins command line. If no trusted sudo binary is available, sudo contexts are `unavailable`; if a trusted sudo exists but its policy probe cannot establish authorization, they remain `unknown` rather than becoming `confirmed`.
 
 ## Exit status
 
