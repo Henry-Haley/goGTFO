@@ -1762,21 +1762,130 @@ func TestParseOptionsAndHelpBeforeNetwork(t *testing.T) {
 		t.Fatal("invalid sort was accepted")
 	}
 
-	output := captureProcessOutput(t, func() {
-		if code := run([]string{"-plain", "-h"}); code != 0 {
-			t.Fatalf("help exit = %d", code)
+	for _, args := range [][]string{{"-plain", "-h"}, {"-plain", "-help"}} {
+		calls := 0
+		output := captureProcessOutput(t, func() {
+			if code := runWithCatalogFetcher(args, func(context.Context) (catalog, error) {
+				calls++
+				return catalog{}, errors.New("catalog fetch must not run")
+			}); code != 0 {
+				t.Fatalf("help exit = %d", code)
+			}
+		})
+		if calls != 0 {
+			t.Fatalf("help fetched the catalog %d times", calls)
+		}
+		for _, text := range []string{"goGTFO identifies GTFOBins", "never executes GTFOBins techniques", "-all", "-check-sudo", "binary, context, or attack"} {
+			if !strings.Contains(output, text) {
+				t.Fatalf("help lacks %q: %s", text, output)
+			}
+		}
+		for _, stale := range []string{"LOLBAS", "Windows", "Administrator", "SYSTEM", "Aaron Kidwell", "-driver"} {
+			if strings.Contains(output, stale) {
+				t.Fatalf("help contains stale runtime wording %q: %s", stale, output)
+			}
+		}
+	}
+}
+
+func TestRunExitCodesAndCLIContract(t *testing.T) {
+	previousPlainMode := plainMode
+	defer func() { plainMode = previousPlainMode }()
+
+	runWith := func(args []string, data catalog, fetchErr error) (int, string, string, int) {
+		calls := 0
+		code := -1
+		stdout, stderr := captureProcessStreams(t, func() {
+			code = runWithCatalogFetcher(args, func(context.Context) (catalog, error) {
+				calls++
+				return data, fetchErr
+			})
+		})
+		return code, stdout, stderr, calls
+	}
+
+	t.Run("invalid options never fetch", func(t *testing.T) {
+		for _, test := range []struct {
+			args      []string
+			errorText string
+		}{
+			{[]string{"-plain", "-sort", "invalid"}, "unknown sort"},
+			{[]string{"-plain", "-driver"}, "flag provided but not defined: -driver"},
+			{[]string{"-plain", "unexpected"}, "unexpected arguments"},
+		} {
+			code, _, stderr, calls := runWith(test.args, catalog{}, errors.New("catalog fetch must not run"))
+			if code != 2 || calls != 0 || !strings.Contains(stderr, test.errorText) {
+				t.Fatalf("run(%v) = code %d, calls %d, stderr %q", test.args, code, calls, stderr)
+			}
 		}
 	})
-	for _, text := range []string{"goGTFO identifies GTFOBins", "never executes GTFOBins techniques", "-all", "-check-sudo", "binary, context, or attack"} {
-		if !strings.Contains(output, text) {
-			t.Fatalf("help lacks %q: %s", text, output)
+
+	t.Run("fetch parse and validation failures", func(t *testing.T) {
+		tests := []struct {
+			name string
+			err  error
+		}{
+			{"fetch", errors.New("fetch catalog: test failure")},
+			{"parse", func() error { _, err := decodeCatalog(strings.NewReader("{")); return err }()},
+			{"validation", func() error {
+				_, err := decodeCatalog(strings.NewReader(`{"functions":{},"contexts":{"unprivileged":{}},"executables":{"tool":{}}}`))
+				return err
+			}()},
 		}
-	}
-	for _, stale := range []string{"LOLBAS", "Windows", "Administrator", "SYSTEM", "Aaron Kidwell"} {
-		if strings.Contains(output, stale) {
-			t.Fatalf("help contains stale runtime wording %q: %s", stale, output)
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				code, stdout, stderr, calls := runWith([]string{"-plain"}, catalog{}, test.err)
+				if code != 1 || calls != 1 || !strings.Contains(stdout, "[+] Failed") || !strings.Contains(stderr, test.err.Error()) {
+					t.Fatalf("code=%d calls=%d stdout=%q stderr=%q", code, calls, stdout, stderr)
+				}
+				if bytes.Contains([]byte(stdout), []byte{0x1b}) {
+					t.Fatalf("plain failure emitted ESC: %q", stdout)
+				}
+			})
 		}
-	}
+	})
+
+	t.Run("catalog miss ambiguity and PATH miss", func(t *testing.T) {
+		catalogData := phase9Catalog([]string{"Tool", "tool"}, "unprivileged")
+		code, _, stderr, calls := runWith([]string{"-plain", "-s", "missing"}, catalogData, nil)
+		if code != 1 || calls != 1 || !strings.Contains(stderr, "catalog executable name not found") {
+			t.Fatalf("catalog miss: code=%d calls=%d stderr=%q", code, calls, stderr)
+		}
+
+		code, _, stderr, calls = runWith([]string{"-plain", "-s", "TOOL"}, catalogData, nil)
+		if code != 1 || calls != 1 || !strings.Contains(stderr, "catalog executable name is ambiguous") {
+			t.Fatalf("ambiguous search: code=%d calls=%d stderr=%q", code, calls, stderr)
+		}
+
+		missingName := "phase9-not-on-path"
+		code, _, stderr, calls = runWith([]string{"-plain", "-s", missingName}, phase9Catalog([]string{missingName}, "unprivileged"), nil)
+		if code != 1 || calls != 1 || !strings.Contains(stderr, "exists in the GTFOBins catalog but was not found in PATH") {
+			t.Fatalf("PATH miss: code=%d calls=%d stderr=%q", code, calls, stderr)
+		}
+	})
+
+	t.Run("listing filtering all and search", func(t *testing.T) {
+		dir := t.TempDir()
+		name := "phase9-installed"
+		writeTestExecutable(t, dir, name)
+		t.Setenv("PATH", dir)
+		catalogData := phase9Catalog([]string{name}, "unprivileged", "future-context")
+
+		code, stdout, stderr, calls := runWith([]string{"-plain"}, catalogData, nil)
+		if code != 0 || calls != 1 || stderr != "" || !strings.Contains(stdout, "Displayed techniques:  1") || !strings.Contains(stdout, "Hidden unknown:        1") {
+			t.Fatalf("default listing: code=%d calls=%d stdout=%q stderr=%q", code, calls, stdout, stderr)
+		}
+
+		code, stdout, stderr, calls = runWith([]string{"-plain", "-all"}, catalogData, nil)
+		if code != 0 || calls != 1 || stderr != "" || !strings.Contains(stdout, "All contexts:          true") || !strings.Contains(stdout, "Displayed techniques:  2") {
+			t.Fatalf("all listing: code=%d calls=%d stdout=%q stderr=%q", code, calls, stdout, stderr)
+		}
+
+		code, stdout, stderr, calls = runWith([]string{"-plain", "-s", name}, catalogData, nil)
+		if code != 0 || calls != 1 || stderr != "" || !strings.Contains(stdout, "All contexts:          true") || !strings.Contains(stdout, "Context:               future-context") || !strings.Contains(stdout, "State:                 unknown") {
+			t.Fatalf("search listing: code=%d calls=%d stdout=%q stderr=%q", code, calls, stdout, stderr)
+		}
+	})
 }
 
 func TestFilteringAndCounts(t *testing.T) {
@@ -1915,7 +2024,7 @@ func TestRendererPreservesPlainDataAndSanitizesAtBoundary(t *testing.T) {
 	before := report.Findings[0].Techniques[0].Code
 	plainMode = true
 	output := captureProcessOutput(t, func() { renderReport(report) })
-	if strings.Contains(output, "\x1b") || strings.ContainsAny(output, "╭│╰─✓") {
+	if bytes.Contains([]byte(output), []byte{0x1b}) || strings.ContainsAny(output, "╭│╰─✓") {
 		t.Fatalf("plain renderer emitted terminal controls or box drawing: %q", output)
 	}
 	for _, want := range []string{
@@ -2400,6 +2509,26 @@ func basicResolutionCatalog(executables map[string]executableDef) catalog {
 	}
 }
 
+func phase9Catalog(names []string, contextKeys ...string) catalog {
+	contexts := make(map[string]contextMeta, len(contextKeys))
+	exampleContexts := make(map[string]json.RawMessage, len(contextKeys))
+	for _, key := range contextKeys {
+		contexts[key] = contextMeta{Label: key}
+		exampleContexts[key] = json.RawMessage(`{}`)
+	}
+	executables := make(map[string]executableDef, len(names))
+	for _, name := range names {
+		executables[name] = executableDef{Functions: map[string][]exampleDef{
+			"command": {{Code: "display only", Contexts: exampleContexts}},
+		}}
+	}
+	return catalog{
+		Functions:   map[string]functionMeta{"command": {Label: "command"}},
+		Contexts:    contexts,
+		Executables: executables,
+	}
+}
+
 func findingNamed(t *testing.T, result resolutionResult, name string) finding {
 	t.Helper()
 	for _, value := range result.Findings {
@@ -2475,4 +2604,46 @@ func captureProcessOutput(t *testing.T, fn func()) string {
 		t.Fatal(err)
 	}
 	return string(output)
+}
+
+func captureProcessStreams(t *testing.T, fn func()) (string, string) {
+	t.Helper()
+
+	stdoutRead, stdoutWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderrRead, stderrWrite, err := os.Pipe()
+	if err != nil {
+		_ = stdoutRead.Close()
+		_ = stdoutWrite.Close()
+		t.Fatal(err)
+	}
+	oldStdout, oldStderr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = stdoutWrite, stderrWrite
+	defer func() {
+		os.Stdout, os.Stderr = oldStdout, oldStderr
+		_ = stdoutRead.Close()
+		_ = stdoutWrite.Close()
+		_ = stderrRead.Close()
+		_ = stderrWrite.Close()
+	}()
+
+	fn()
+	os.Stdout, os.Stderr = oldStdout, oldStderr
+	if err := stdoutWrite.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := stderrWrite.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := io.ReadAll(stdoutRead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderr, err := io.ReadAll(stderrRead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(stdout), string(stderr)
 }

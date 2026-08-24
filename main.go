@@ -219,6 +219,10 @@ func (l *loadingBox) finish(message string) {
 }
 
 func run(args []string) int {
+	return runWithCatalogFetcher(args, fetchCatalog)
+}
+
+func runWithCatalogFetcher(args []string, fetch func(context.Context) (catalog, error)) int {
 	value, err := parseOptions(args)
 	plainMode = value.Plain
 	if err != nil {
@@ -230,15 +234,15 @@ func run(args []string) int {
 		printHelp()
 		return 0
 	}
-	return runCatalog(context.Background(), value)
+	return runCatalog(context.Background(), value, fetch)
 }
 
-func runCatalog(ctx context.Context, value options) int {
+func runCatalog(ctx context.Context, value options, fetch func(context.Context) (catalog, error)) int {
 	printBanner()
 	loader := newLoadingBox("Fetching GTFOBins catalog...")
 	loader.start()
 
-	catalogData, err := fetchCatalog(ctx)
+	catalogData, err := fetch(ctx)
 	if err != nil {
 		loader.finish("Failed")
 		fmt.Fprintln(os.Stderr, inlineTerminalText(err.Error()))
