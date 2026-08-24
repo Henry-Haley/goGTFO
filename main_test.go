@@ -1324,19 +1324,27 @@ func writeELFProgramHeaderFixture(t *testing.T, path string, types ...elf.ProgTy
 }
 
 func writeELFProgramHeaderFixtureMachine(t *testing.T, path string, machine elf.Machine, types ...elf.ProgType) {
+	writeELFProgramHeaderFixtureMachineData(t, path, machine, elf.ELFDATA2LSB, types...)
+}
+
+func writeELFProgramHeaderFixtureMachineData(t *testing.T, path string, machine elf.Machine, encoding elf.Data, types ...elf.ProgType) {
 	t.Helper()
 	data := make([]byte, 64+56*len(types))
-	copy(data, []byte{0x7f, 'E', 'L', 'F', 2, 1, 1})
-	binary.LittleEndian.PutUint16(data[16:18], uint16(elf.ET_DYN))
-	binary.LittleEndian.PutUint16(data[18:20], uint16(machine))
-	binary.LittleEndian.PutUint32(data[20:24], 1)
-	binary.LittleEndian.PutUint64(data[32:40], 64)
-	binary.LittleEndian.PutUint16(data[52:54], 64)
-	binary.LittleEndian.PutUint16(data[54:56], 56)
-	binary.LittleEndian.PutUint16(data[56:58], uint16(len(types)))
+	copy(data, []byte{0x7f, 'E', 'L', 'F', 2, byte(encoding), 1})
+	order := binary.ByteOrder(binary.LittleEndian)
+	if encoding == elf.ELFDATA2MSB {
+		order = binary.BigEndian
+	}
+	order.PutUint16(data[16:18], uint16(elf.ET_DYN))
+	order.PutUint16(data[18:20], uint16(machine))
+	order.PutUint32(data[20:24], 1)
+	order.PutUint64(data[32:40], 64)
+	order.PutUint16(data[52:54], 64)
+	order.PutUint16(data[54:56], 56)
+	order.PutUint16(data[56:58], uint16(len(types)))
 	for index, typ := range types {
 		offset := 64 + index*56
-		binary.LittleEndian.PutUint32(data[offset:offset+4], uint32(typ))
+		order.PutUint32(data[offset:offset+4], uint32(typ))
 	}
 	if err := os.WriteFile(path, data, 0o700); err != nil {
 		t.Fatal(err)
@@ -1384,6 +1392,15 @@ func TestInspectExecutableFormatRequiresKnownHostMachine(t *testing.T) {
 	}
 }
 
+func TestInspectExecutableFormatRejectsWrongEndianness(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wrong-endian")
+	writeELFProgramHeaderFixtureMachineData(t, path, elf.EM_X86_64, elf.ELFDATA2MSB, elf.PT_LOAD)
+	if got, err := inspectExecutableFormatForArchitecture(path, elf.EM_X86_64, elf.ELFDATA2LSB, true); err != nil || got != executableFormatUnknown {
+		t.Fatalf("wrong-endian ELF = %v, %v; want unknown", got, err)
+	}
+}
+
 func TestInspectExecutableFormatUsesOpenedDescriptor(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "target")
@@ -1411,7 +1428,7 @@ func TestInspectExecutableFormatUsesOpenedDescriptor(t *testing.T) {
 		t.Fatal(err)
 	}
 	machine, known := hostELFMachine()
-	got, err := inspectExecutableFormatFile(file, machine, known)
+	got, err := inspectExecutableFormatFile(file, machine, elf.ELFDATANONE, known)
 	if err != nil || got != executableFormatELF {
 		t.Fatalf("opened descriptor classification = %v, %v; want ELF", got, err)
 	}

@@ -559,20 +559,24 @@ func inspectCanonicalExecutable(result executableDiscovery) executableDiscovery 
 }
 
 func inspectExecutableFormat(path string) (executableFormat, error) {
-	expectedMachine, knownHostMachine := hostELFMachine()
-	return inspectExecutableFormatForMachine(path, expectedMachine, knownHostMachine)
+	expectedMachine, expectedData, knownHostMachine := hostELFFormat()
+	return inspectExecutableFormatForArchitecture(path, expectedMachine, expectedData, knownHostMachine)
 }
 
 func inspectExecutableFormatForMachine(path string, expectedMachine elf.Machine, knownHostMachine bool) (executableFormat, error) {
+	return inspectExecutableFormatForArchitecture(path, expectedMachine, elf.ELFDATANONE, knownHostMachine)
+}
+
+func inspectExecutableFormatForArchitecture(path string, expectedMachine elf.Machine, expectedData elf.Data, knownHostMachine bool) (executableFormat, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return executableFormatUnknown, err
 	}
 	defer file.Close()
-	return inspectExecutableFormatFile(file, expectedMachine, knownHostMachine)
+	return inspectExecutableFormatFile(file, expectedMachine, expectedData, knownHostMachine)
 }
 
-func inspectExecutableFormatFile(file *os.File, expectedMachine elf.Machine, knownHostMachine bool) (executableFormat, error) {
+func inspectExecutableFormatFile(file *os.File, expectedMachine elf.Machine, expectedData elf.Data, knownHostMachine bool) (executableFormat, error) {
 	var header [4]byte
 	n, err := io.ReadFull(file, header[:])
 	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
@@ -597,7 +601,7 @@ func inspectExecutableFormatFile(file *os.File, expectedMachine elf.Machine, kno
 		if (parsed.Type != elf.ET_EXEC && parsed.Type != elf.ET_DYN) || !hasLoadableSegment {
 			return executableFormatMalformedELF, nil
 		}
-		if !knownHostMachine || parsed.Machine != expectedMachine {
+		if !knownHostMachine || parsed.Machine != expectedMachine || (expectedData != elf.ELFDATANONE && parsed.Data != expectedData) {
 			return executableFormatUnknown, nil
 		}
 		return executableFormatELF, nil
@@ -606,27 +610,40 @@ func inspectExecutableFormatFile(file *os.File, expectedMachine elf.Machine, kno
 }
 
 func hostELFMachine() (elf.Machine, bool) {
+	machine, _, known := hostELFFormat()
+	return machine, known
+}
+
+func hostELFFormat() (elf.Machine, elf.Data, bool) {
 	switch runtime.GOARCH {
 	case "386":
-		return elf.EM_386, true
+		return elf.EM_386, elf.ELFDATA2LSB, true
 	case "amd64":
-		return elf.EM_X86_64, true
+		return elf.EM_X86_64, elf.ELFDATA2LSB, true
 	case "arm":
-		return elf.EM_ARM, true
+		return elf.EM_ARM, elf.ELFDATA2LSB, true
 	case "arm64":
-		return elf.EM_AARCH64, true
-	case "mips", "mipsle", "mips64", "mips64le":
-		return elf.EM_MIPS, true
-	case "ppc64", "ppc64le":
-		return elf.EM_PPC64, true
-	case "riscv64":
-		return elf.EM_RISCV, true
-	case "s390x":
-		return elf.EM_S390, true
+		return elf.EM_AARCH64, elf.ELFDATA2LSB, true
 	case "loong64":
-		return elf.EM_LOONGARCH, true
+		return elf.EM_LOONGARCH, elf.ELFDATA2LSB, true
+	case "mips":
+		return elf.EM_MIPS, elf.ELFDATA2MSB, true
+	case "mipsle":
+		return elf.EM_MIPS, elf.ELFDATA2LSB, true
+	case "mips64":
+		return elf.EM_MIPS, elf.ELFDATA2MSB, true
+	case "mips64le":
+		return elf.EM_MIPS, elf.ELFDATA2LSB, true
+	case "ppc64":
+		return elf.EM_PPC64, elf.ELFDATA2MSB, true
+	case "ppc64le":
+		return elf.EM_PPC64, elf.ELFDATA2LSB, true
+	case "riscv64":
+		return elf.EM_RISCV, elf.ELFDATA2LSB, true
+	case "s390x":
+		return elf.EM_S390, elf.ELFDATA2MSB, true
 	default:
-		return 0, false
+		return 0, elf.ELFDATANONE, false
 	}
 }
 
