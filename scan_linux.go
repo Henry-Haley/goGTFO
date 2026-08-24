@@ -559,6 +559,11 @@ func inspectCanonicalExecutable(result executableDiscovery) executableDiscovery 
 }
 
 func inspectExecutableFormat(path string) (executableFormat, error) {
+	expectedMachine, knownHostMachine := hostELFMachine()
+	return inspectExecutableFormatForMachine(path, expectedMachine, knownHostMachine)
+}
+
+func inspectExecutableFormatForMachine(path string, expectedMachine elf.Machine, knownHostMachine bool) (executableFormat, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return executableFormatUnknown, err
@@ -588,7 +593,7 @@ func inspectExecutableFormat(path string) (executableFormat, error) {
 		if (parsed.Type != elf.ET_EXEC && parsed.Type != elf.ET_DYN) || !hasLoadableSegment {
 			return executableFormatMalformedELF, nil
 		}
-		if expected, ok := hostELFMachine(); ok && parsed.Machine != expected {
+		if !knownHostMachine || parsed.Machine != expectedMachine {
 			return executableFormatUnknown, nil
 		}
 		return executableFormatELF, nil

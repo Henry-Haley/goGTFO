@@ -1356,6 +1356,34 @@ func TestInspectExecutableFormatRejectsForeignArchitecture(t *testing.T) {
 	}
 }
 
+func TestInspectExecutableFormatRequiresKnownHostMachine(t *testing.T) {
+	dir := t.TempDir()
+	matching := filepath.Join(dir, "matching")
+	foreign := filepath.Join(dir, "foreign")
+	writeELFProgramHeaderFixtureMachine(t, matching, elf.EM_X86_64, elf.PT_LOAD)
+	writeELFProgramHeaderFixtureMachine(t, foreign, elf.EM_AARCH64, elf.PT_LOAD)
+
+	for _, tt := range []struct {
+		name             string
+		path             string
+		expectedMachine  elf.Machine
+		knownHostMachine bool
+		want             executableFormat
+	}{
+		{"known host matching ELF", matching, elf.EM_X86_64, true, executableFormatELF},
+		{"known host foreign ELF", foreign, elf.EM_X86_64, true, executableFormatUnknown},
+		{"unknown host matching ELF", matching, elf.EM_X86_64, false, executableFormatUnknown},
+		{"unknown host foreign ELF", foreign, elf.EM_X86_64, false, executableFormatUnknown},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := inspectExecutableFormatForMachine(tt.path, tt.expectedMachine, tt.knownHostMachine)
+			if err != nil || got != tt.want {
+				t.Fatalf("inspectExecutableFormatForMachine(%q, %v, %v) = %v, %v; want %v", tt.path, tt.expectedMachine, tt.knownHostMachine, got, err, tt.want)
+			}
+		})
+	}
+}
+
 func TestInspectExecutableFormatRequiresLoadableSegment(t *testing.T) {
 	dir := t.TempDir()
 	noteOnly := filepath.Join(dir, "note-only")
