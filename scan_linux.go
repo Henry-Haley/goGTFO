@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -552,9 +553,35 @@ func inspectExecutableFormat(path string) (executableFormat, error) {
 		if (parsed.Type != elf.ET_EXEC && parsed.Type != elf.ET_DYN) || !hasLoadableSegment {
 			return executableFormatMalformedELF, nil
 		}
+		if expected, ok := hostELFMachine(); ok && parsed.Machine != expected {
+			return executableFormatUnknown, nil
+		}
 		return executableFormatELF, nil
 	}
 	return executableFormatUnknown, nil
+}
+
+func hostELFMachine() (elf.Machine, bool) {
+	switch runtime.GOARCH {
+	case "386":
+		return elf.EM_386, true
+	case "amd64":
+		return elf.EM_X86_64, true
+	case "arm":
+		return elf.EM_ARM, true
+	case "arm64":
+		return elf.EM_AARCH64, true
+	case "mips", "mipsle", "mips64", "mips64le":
+		return elf.EM_MIPS, true
+	case "ppc64", "ppc64le":
+		return elf.EM_PPC64, true
+	case "riscv64":
+		return elf.EM_RISCV, true
+	case "s390x":
+		return elf.EM_S390, true
+	default:
+		return 0, false
+	}
 }
 
 func inspectMount(path string) (mountStatus, error) {

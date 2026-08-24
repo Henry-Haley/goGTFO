@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -1255,11 +1256,19 @@ func TestInspectExecutableFormat(t *testing.T) {
 }
 
 func writeELFProgramHeaderFixture(t *testing.T, path string, types ...elf.ProgType) {
+	machine, ok := hostELFMachine()
+	if !ok {
+		t.Fatal("test host ELF machine is unknown")
+	}
+	writeELFProgramHeaderFixtureMachine(t, path, machine, types...)
+}
+
+func writeELFProgramHeaderFixtureMachine(t *testing.T, path string, machine elf.Machine, types ...elf.ProgType) {
 	t.Helper()
 	data := make([]byte, 64+56*len(types))
 	copy(data, []byte{0x7f, 'E', 'L', 'F', 2, 1, 1})
 	binary.LittleEndian.PutUint16(data[16:18], uint16(elf.ET_DYN))
-	binary.LittleEndian.PutUint16(data[18:20], uint16(elf.EM_X86_64))
+	binary.LittleEndian.PutUint16(data[18:20], uint16(machine))
 	binary.LittleEndian.PutUint32(data[20:24], 1)
 	binary.LittleEndian.PutUint64(data[32:40], 64)
 	binary.LittleEndian.PutUint16(data[52:54], 64)
@@ -1271,6 +1280,19 @@ func writeELFProgramHeaderFixture(t *testing.T, path string, types ...elf.ProgTy
 	}
 	if err := os.WriteFile(path, data, 0o700); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestInspectExecutableFormatRejectsForeignArchitecture(t *testing.T) {
+	dir := t.TempDir()
+	foreign := elf.EM_AARCH64
+	if runtime.GOARCH == "arm64" {
+		foreign = elf.EM_X86_64
+	}
+	path := filepath.Join(dir, "foreign")
+	writeELFProgramHeaderFixtureMachine(t, path, foreign, elf.PT_LOAD)
+	if got, err := inspectExecutableFormat(path); err != nil || got != executableFormatUnknown {
+		t.Fatalf("foreign-architecture ELF = %v, %v; want unknown", got, err)
 	}
 }
 
