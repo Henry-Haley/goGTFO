@@ -220,16 +220,18 @@ type mountStatus struct {
 }
 
 type executableDiscovery struct {
-	CatalogName   string
-	Found         bool
-	InvocablePath string
-	CanonicalPath string
-	FileInfo      os.FileInfo
-	Executable    bool
-	Format        executableFormat
-	Mount         mountStatus
-	Usable        bool
-	Warning       string
+	CatalogName           string
+	Found                 bool
+	InvocablePath         string
+	CanonicalPath         string
+	FileInfo              os.FileInfo
+	Executable            bool
+	Format                executableFormat
+	Mount                 mountStatus
+	Usable                bool
+	Capabilities          fileCapabilityInspection
+	CapabilitiesInspected bool
+	Warning               string
 }
 
 type catalogSearchResult struct {
@@ -552,6 +554,8 @@ func inspectCanonicalExecutable(result executableDiscovery) executableDiscovery 
 		return result
 	}
 	result.Executable = true
+	result.Capabilities = inspectFileCapabilitiesDescriptor(anchor)
+	result.CapabilitiesInspected = true
 	readable, err := os.Open(filepath.Join("/proc/self/fd", strconv.Itoa(fd)))
 	if err != nil {
 		result.Warning = fmt.Sprintf("open canonical executable for catalog executable %q: %v", result.CatalogName, err)
@@ -922,6 +926,10 @@ func inspectFileCapabilities(path string) fileCapabilityInspection {
 	return fileCapabilityInspection{Present: true, Err: errors.New("security.capability changed while reading")}
 }
 
+func inspectFileCapabilitiesDescriptor(file *os.File) fileCapabilityInspection {
+	return inspectFileCapabilities(filepath.Join("/proc/self/fd", strconv.Itoa(int(file.Fd()))))
+}
+
 func fileCapabilityInspectionError(err error) fileCapabilityInspection {
 	if errors.Is(err, unix.ENODATA) {
 		return fileCapabilityInspection{Known: true}
@@ -1259,7 +1267,11 @@ func collectCapabilityInspections(findings []finding, discoveries []executableDi
 			continue
 		}
 		if _, cached := result[path]; !cached {
-			result[path] = inspect(path)
+			if discovery.CapabilitiesInspected {
+				result[path] = discovery.Capabilities
+			} else {
+				result[path] = inspect(path)
+			}
 		}
 	}
 	return result

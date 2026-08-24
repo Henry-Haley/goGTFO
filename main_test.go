@@ -810,6 +810,39 @@ func TestInspectCanonicalExecutableDoesNotBlockOnFIFO(t *testing.T) {
 	}
 }
 
+func TestCapabilityInspectionUsesOpenedDescriptor(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "candidate")
+	replacement := filepath.Join(dir, "replacement")
+	writeTestExecutable(t, dir, "candidate")
+	writeTestExecutable(t, dir, "replacement")
+	capA := capabilityXattrFixture(vfsCapabilityRevision2, 1, 0, true, 0)
+	capB := capabilityXattrFixture(vfsCapabilityRevision2, 2, 0, true, 0)
+	if err := unix.Setxattr(path, securityCapabilityXattr, capA, 0); err != nil {
+		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EOPNOTSUPP) {
+			t.Skipf("security.capability unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	if err := unix.Setxattr(replacement, securityCapabilityXattr, capB, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	fd, err := unix.Open(path, unix.O_PATH|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := os.NewFile(uintptr(fd), path)
+	defer file.Close()
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatal(err)
+	}
+	got := inspectFileCapabilitiesDescriptor(file)
+	if !got.Known || !got.Present || got.Capabilities.Permitted != 1 {
+		t.Fatalf("descriptor capability inspection = %#v, want inode A capability", got)
+	}
+}
+
 func TestInterpretMountFlags(t *testing.T) {
 	tests := []struct {
 		name   string
