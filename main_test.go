@@ -2439,6 +2439,30 @@ func TestCapabilityEvidenceStaysBoundToDiscovery(t *testing.T) {
 	}
 }
 
+func TestNonCapabilityEvidenceStaysBoundToDiscovery(t *testing.T) {
+	findings := []finding{
+		{Name: "A", Techniques: []technique{{ContextKey: "unprivileged"}, {ContextKey: "suid"}}},
+		{Name: "B", Techniques: []technique{{ContextKey: "unprivileged"}, {ContextKey: "suid"}}},
+	}
+	good := staticDiscovery("A", "/shared/a", "/shared/object", 0o755|os.ModeSetuid, mountStatus{Known: true})
+	bad := staticDiscovery("B", "/shared/b", "/shared/object", 0o755, mountStatus{Known: true, NoExec: true})
+	bad.Format = executableFormatMalformedELF
+	bad.FileInfo = staticFileInfo{name: "B", mode: 0o755, uid: 1000}
+	host := hostSnapshot{procStatus: procStatus{NoNewPrivsKnown: true, CapBndKnown: true}}
+	got := evaluateFindings(findings, []executableDiscovery{good, bad}, host, sudoProbeBatch{}, nil)
+	if len(got) != 2 {
+		t.Fatalf("evaluated findings = %#v", got)
+	}
+	if got[0].Techniques[0].State != stateConfirmed || got[0].Techniques[1].State != stateConfirmed {
+		t.Fatalf("good discovery changed by shared path: %#v", got[0].Techniques)
+	}
+	for _, candidate := range got[1].Techniques {
+		if candidate.State == stateConfirmed {
+			t.Fatalf("bad discovery inherited good path evidence: %#v", got[1].Techniques)
+		}
+	}
+}
+
 func TestSudoProbeBatchStatus(t *testing.T) {
 	tests := []struct {
 		name      string
