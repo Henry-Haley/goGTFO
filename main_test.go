@@ -1289,6 +1289,7 @@ func TestSUIDFormatEndToEndRejectsNoteOnlyELF(t *testing.T) {
 		t.Fatalf("real ELF discovery = %#v", validDiscovery)
 	}
 	validDiscovery.FileInfo = staticFileInfo{name: "valid", mode: 0o755 | os.ModeSetuid, uid: 0}
+	validDiscovery.Mount = mountStatus{Known: true}
 	validResult := evaluateContext("suid", nil, "", validDiscovery, hostSnapshot{procStatus: procStatus{NoNewPrivsKnown: true}}, sudoProbeBatch{}, nil)
 	if validResult.State != stateConfirmed {
 		t.Fatalf("real ELF SUID control = %#v", validResult)
