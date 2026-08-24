@@ -1176,6 +1176,17 @@ func TestInspectExecutableFormat(t *testing.T) {
 	if err := os.WriteFile(malformed, []byte{0x7f, 'E', 'L', 'F', 99, 99, 99, 99, 99, 99, 99, 99}, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	headerOnly := filepath.Join(dir, "header-only")
+	header := make([]byte, 64)
+	copy(header, []byte{0x7f, 'E', 'L', 'F', 2, 1, 1})
+	binary.LittleEndian.PutUint16(header[16:18], 2)
+	binary.LittleEndian.PutUint16(header[18:20], 62)
+	binary.LittleEndian.PutUint32(header[20:24], 1)
+	binary.LittleEndian.PutUint16(header[52:54], 64)
+	binary.LittleEndian.PutUint16(header[54:56], 56)
+	if err := os.WriteFile(headerOnly, header, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	unknown := filepath.Join(dir, "unknown")
 	if err := os.WriteFile(unknown, []byte("fixture"), 0o700); err != nil {
 		t.Fatal(err)
@@ -1198,6 +1209,7 @@ func TestInspectExecutableFormat(t *testing.T) {
 		magicOnly:     executableFormatMalformedELF,
 		truncated:     executableFormatMalformedELF,
 		malformed:     executableFormatMalformedELF,
+		headerOnly:    executableFormatMalformedELF,
 		unknown:       executableFormatUnknown,
 		empty:         executableFormatUnknown,
 		validLink:     executableFormatELF,

@@ -523,7 +523,7 @@ func inspectExecutableFormat(path string) (executableFormat, error) {
 			return executableFormatMalformedELF, nil
 		}
 		defer parsed.Close()
-		if parsed.Type != elf.ET_EXEC && parsed.Type != elf.ET_DYN {
+		if (parsed.Type != elf.ET_EXEC && parsed.Type != elf.ET_DYN) || len(parsed.Progs) == 0 {
 			return executableFormatMalformedELF, nil
 		}
 		return executableFormatELF, nil
