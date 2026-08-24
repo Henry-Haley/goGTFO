@@ -1153,6 +1153,7 @@ func TestEvaluateSUID(t *testing.T) {
 		{"nosuid", func(input *suidEvaluationInput) { input.Mount.NoSUID = true }, stateUnavailable, "mounted nosuid"},
 		{"noexec", func(input *suidEvaluationInput) { input.Mount.NoExec = true }, stateUnavailable, "mounted noexec"},
 		{"NoNewPrivs enabled", func(input *suidEvaluationInput) { input.NoNewPrivs = true }, stateUnavailable, "NoNewPrivs is enabled"},
+		{"non-initial user namespace", func(input *suidEvaluationInput) { input.UserNamespaceKnown = true; input.InitialUserNamespace = false }, stateUnavailable, "initial user namespace"},
 		{"owner unknown", func(input *suidEvaluationInput) { input.OwnerUIDKnown = false }, stateUnknown, "owner UID could not be determined"},
 		{"mount unknown", func(input *suidEvaluationInput) { input.Mount.Known = false }, stateUnknown, "mount flags could not be determined"},
 		{"NoNewPrivs unknown", func(input *suidEvaluationInput) { input.NoNewPrivsKnown = false }, stateUnknown, "NoNewPrivs could not be determined"},
@@ -1624,6 +1625,10 @@ func TestEvaluateCapabilities(t *testing.T) {
 		{"nosuid", func(input *capabilityEvaluationInput) { input.Mount.NoSUID = true }, stateUnavailable, "mounted nosuid"},
 		{"noexec", func(input *capabilityEvaluationInput) { input.Mount.NoExec = true }, stateUnavailable, "mounted noexec"},
 		{"NoNewPrivs enabled", func(input *capabilityEvaluationInput) { input.NoNewPrivs = true }, stateUnavailable, "NoNewPrivs is enabled"},
+		{"non-initial user namespace", func(input *capabilityEvaluationInput) {
+			input.UserNamespaceKnown = true
+			input.InitialUserNamespace = false
+		}, stateUnavailable, "initial user namespace"},
 		{"NoNewPrivs unknown", func(input *capabilityEvaluationInput) { input.NoNewPrivsKnown = false }, stateUnknown, "NoNewPrivs could not be determined"},
 		{"mount unknown", func(input *capabilityEvaluationInput) { input.Mount.Known = false }, stateUnknown, "mount flags could not be determined"},
 		{"version restriction", func(input *capabilityEvaluationInput) { input.Version = "fixture <= 1" }, stateUnknown, "version restriction was not verified"},

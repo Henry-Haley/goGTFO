@@ -85,16 +85,18 @@ type sudoEvaluationInput struct {
 type sudoRunner func(context.Context, string, string) error
 
 type suidEvaluationInput struct {
-	FileInspected   bool
-	Regular         bool
-	Format          executableFormat
-	Mode            os.FileMode
-	OwnerUIDKnown   bool
-	OwnerUID        uint32
-	Mount           mountStatus
-	NoNewPrivsKnown bool
-	NoNewPrivs      bool
-	Version         string
+	FileInspected        bool
+	Regular              bool
+	Format               executableFormat
+	Mode                 os.FileMode
+	OwnerUIDKnown        bool
+	OwnerUID             uint32
+	Mount                mountStatus
+	NoNewPrivsKnown      bool
+	NoNewPrivs           bool
+	UserNamespaceKnown   bool
+	InitialUserNamespace bool
+	Version              string
 }
 
 type executableFormat uint8
@@ -130,18 +132,20 @@ type requiredCapabilities struct {
 }
 
 type capabilityEvaluationInput struct {
-	FileInspected    bool
-	Regular          bool
-	Executable       bool
-	Mount            mountStatus
-	NoNewPrivsKnown  bool
-	NoNewPrivs       bool
-	CapBndKnown      bool
-	CapBnd           uint64
-	Required         requiredCapabilities
-	Xattr            fileCapabilityInspection
-	RequireEffective bool
-	Version          string
+	FileInspected        bool
+	Regular              bool
+	Executable           bool
+	Mount                mountStatus
+	NoNewPrivsKnown      bool
+	NoNewPrivs           bool
+	UserNamespaceKnown   bool
+	InitialUserNamespace bool
+	CapBndKnown          bool
+	CapBnd               uint64
+	Required             requiredCapabilities
+	Xattr                fileCapabilityInspection
+	RequireEffective     bool
+	Version              string
 }
 
 var linuxCapabilityBits = map[string]uint{
@@ -197,11 +201,13 @@ type procStatus struct {
 
 type hostSnapshot struct {
 	procStatus
-	RealUID            int
-	EffectiveUID       int
-	SudoPresent        bool
-	SudoProbeRequested bool
-	Warnings           []string
+	RealUID              int
+	EffectiveUID         int
+	UserNamespaceKnown   bool
+	InitialUserNamespace bool
+	SudoPresent          bool
+	SudoProbeRequested   bool
+	Warnings             []string
 }
 
 type mountStatus struct {
@@ -319,6 +325,13 @@ func captureHostSnapshotAtWithSudoResolver(statusPath string, sudoProbeRequested
 		EffectiveUID:       os.Geteuid(),
 		SudoProbeRequested: sudoProbeRequested,
 	}
+	if err := trustedUserNamespace(); err == nil {
+		snapshot.UserNamespaceKnown = true
+		snapshot.InitialUserNamespace = true
+	} else {
+		snapshot.UserNamespaceKnown = true
+		snapshot.Warnings = append(snapshot.Warnings, fmt.Sprintf("initial user namespace unavailable: %v", err))
+	}
 
 	statusFile, err := os.Open(statusPath)
 	if err != nil {
@@ -332,10 +345,12 @@ func captureHostSnapshotAtWithSudoResolver(statusPath string, sudoProbeRequested
 		}
 	}
 
-	if _, err := resolve(); err == nil {
+	if _, err := resolve(); err == nil && snapshot.InitialUserNamespace {
 		snapshot.SudoPresent = true
 	} else {
-		snapshot.Warnings = append(snapshot.Warnings, err.Error())
+		if err != nil {
+			snapshot.Warnings = append(snapshot.Warnings, err.Error())
+		}
 	}
 	return snapshot
 }
@@ -727,6 +742,10 @@ func evaluateSUID(input suidEvaluationInput) applicabilityResult {
 			evidence = append(evidence, "canonical target does not have setuid bit")
 		}
 	}
+	if input.UserNamespaceKnown && !input.InitialUserNamespace {
+		states = append(states, stateUnavailable)
+		evidence = append(evidence, "SUID applicability requires the initial user namespace")
+	}
 
 	if !input.OwnerUIDKnown {
 		states = append(states, stateUnknown)
@@ -883,6 +902,10 @@ func evaluateCapabilities(input capabilityEvaluationInput) applicabilityResult {
 			evidence = append(evidence, "canonical target is not executable")
 		}
 	}
+	if input.UserNamespaceKnown && !input.InitialUserNamespace {
+		states = append(states, stateUnavailable)
+		evidence = append(evidence, "capability applicability requires the initial user namespace")
+	}
 
 	if !input.Mount.Known {
 		states = append(states, stateUnknown)
@@ -1024,33 +1047,37 @@ func evaluateContext(contextKey string, contextList []string, version string, di
 	case "suid":
 		ownerUID, ownerKnown := canonicalOwnerUID(discovery.FileInfo)
 		return composeApplicabilityResults(common, evaluateSUID(suidEvaluationInput{
-			FileInspected:   fileInspected,
-			Regular:         regular,
-			Format:          discovery.Format,
-			Mode:            mode,
-			OwnerUIDKnown:   ownerKnown,
-			OwnerUID:        ownerUID,
-			Mount:           discovery.Mount,
-			NoNewPrivsKnown: host.NoNewPrivsKnown,
-			NoNewPrivs:      host.NoNewPrivs,
-			Version:         version,
+			FileInspected:        fileInspected,
+			Regular:              regular,
+			Format:               discovery.Format,
+			Mode:                 mode,
+			OwnerUIDKnown:        ownerKnown,
+			OwnerUID:             ownerUID,
+			Mount:                discovery.Mount,
+			NoNewPrivsKnown:      host.NoNewPrivsKnown,
+			NoNewPrivs:           host.NoNewPrivs,
+			UserNamespaceKnown:   host.UserNamespaceKnown,
+			InitialUserNamespace: host.InitialUserNamespace,
+			Version:              version,
 		}))
 	case "capabilities":
 		// GTFOBins has no structured field proving that a technique works without
 		// effective file capabilities, so the first release requires the flag.
 		return composeApplicabilityResults(common, evaluateCapabilities(capabilityEvaluationInput{
-			FileInspected:    fileInspected,
-			Regular:          regular,
-			Executable:       discovery.Executable,
-			Mount:            discovery.Mount,
-			NoNewPrivsKnown:  host.NoNewPrivsKnown,
-			NoNewPrivs:       host.NoNewPrivs,
-			CapBndKnown:      host.CapBndKnown,
-			CapBnd:           host.CapBnd,
-			Required:         parseRequiredCapabilities(contextList),
-			Xattr:            capabilities[discovery.CanonicalPath],
-			RequireEffective: true,
-			Version:          version,
+			FileInspected:        fileInspected,
+			Regular:              regular,
+			Executable:           discovery.Executable,
+			Mount:                discovery.Mount,
+			NoNewPrivsKnown:      host.NoNewPrivsKnown,
+			NoNewPrivs:           host.NoNewPrivs,
+			UserNamespaceKnown:   host.UserNamespaceKnown,
+			InitialUserNamespace: host.InitialUserNamespace,
+			CapBndKnown:          host.CapBndKnown,
+			CapBnd:               host.CapBnd,
+			Required:             parseRequiredCapabilities(contextList),
+			Xattr:                capabilities[discovery.CanonicalPath],
+			RequireEffective:     true,
+			Version:              version,
 		}))
 	case "sudo":
 		present := host.SudoPresent || sudoBatch.SudoPath != ""
