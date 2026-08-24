@@ -530,7 +530,14 @@ func discoverExecutable(name string) executableDiscovery {
 }
 
 func inspectCanonicalExecutable(result executableDiscovery) executableDiscovery {
-	info, err := os.Stat(result.CanonicalPath)
+	fd, err := unix.Open(result.CanonicalPath, unix.O_PATH|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		result.Warning = fmt.Sprintf("stat canonical target for catalog executable %q: %v", result.CatalogName, err)
+		return result
+	}
+	anchor := os.NewFile(uintptr(fd), result.CanonicalPath)
+	defer anchor.Close()
+	info, err := anchor.Stat()
 	if err != nil {
 		result.Warning = fmt.Sprintf("stat canonical target for catalog executable %q: %v", result.CatalogName, err)
 		return result
@@ -545,12 +552,19 @@ func inspectCanonicalExecutable(result executableDiscovery) executableDiscovery 
 		return result
 	}
 	result.Executable = true
-	result.Format, err = inspectExecutableFormat(result.CanonicalPath)
+	readable, err := os.Open(filepath.Join("/proc/self/fd", strconv.Itoa(fd)))
+	if err != nil {
+		result.Warning = fmt.Sprintf("open canonical executable for catalog executable %q: %v", result.CatalogName, err)
+		return result
+	}
+	defer readable.Close()
+	expectedMachine, expectedData, knownHostMachine := hostELFFormat()
+	result.Format, err = inspectExecutableFormatFile(readable, expectedMachine, expectedData, knownHostMachine)
 	if err != nil {
 		result.Warning = fmt.Sprintf("inspect executable format for catalog executable %q: %v", result.CatalogName, err)
 	}
 
-	result.Mount, err = inspectMount(result.CanonicalPath)
+	result.Mount, err = inspectMountFile(anchor)
 	if err != nil {
 		result.Warning = fmt.Sprintf("inspect filesystem flags for catalog executable %q: %v", result.CatalogName, err)
 		return result
@@ -654,6 +668,14 @@ func hostELFFormat() (elf.Machine, elf.Data, bool) {
 func inspectMount(path string) (mountStatus, error) {
 	var stat unix.Statfs_t
 	if err := unix.Statfs(path, &stat); err != nil {
+		return mountStatus{}, err
+	}
+	return interpretMountFlags(int64(stat.Flags)), nil
+}
+
+func inspectMountFile(file *os.File) (mountStatus, error) {
+	var stat unix.Statfs_t
+	if err := unix.Fstatfs(int(file.Fd()), &stat); err != nil {
 		return mountStatus{}, err
 	}
 	return interpretMountFlags(int64(stat.Flags)), nil

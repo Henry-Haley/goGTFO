@@ -791,6 +791,25 @@ func TestCanonicalTargetFailuresAreNonfatal(t *testing.T) {
 	})
 }
 
+func TestInspectCanonicalExecutableDoesNotBlockOnFIFO(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fifo")
+	if err := unix.Mkfifo(path, 0o700); err != nil {
+		t.Skipf("FIFO unavailable: %v", err)
+	}
+	done := make(chan executableDiscovery, 1)
+	go func() {
+		done <- inspectCanonicalExecutable(executableDiscovery{CatalogName: "fifo", Found: true, CanonicalPath: path})
+	}()
+	select {
+	case result := <-done:
+		if result.Warning == "" || result.FileInfo == nil || result.FileInfo.Mode().IsRegular() {
+			t.Fatalf("FIFO inspection = %#v; want bounded non-regular warning", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("FIFO inspection blocked")
+	}
+}
+
 func TestInterpretMountFlags(t *testing.T) {
 	tests := []struct {
 		name   string
