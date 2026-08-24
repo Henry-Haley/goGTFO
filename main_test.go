@@ -2368,19 +2368,21 @@ func TestCapabilityInspectionFallbackIsKeyedByCatalogName(t *testing.T) {
 		{Name: "B", Techniques: []technique{{ContextKey: "capabilities"}}},
 		{Name: "C", Techniques: []technique{{ContextKey: "unprivileged"}}},
 		{Name: "D", Techniques: []technique{{ContextKey: "unprivileged", Launchers: []launcherStep{{ContextKey: "capabilities"}}}}},
+		{Name: "E", Techniques: []technique{{ContextKey: "capabilities"}}},
 	}
 	discoveries := []executableDiscovery{
 		staticDiscovery("A", "/Alias/A", "/Canonical/Shared", 0o755, mountStatus{Known: true}),
 		staticDiscovery("B", "/Alias/B", "/Canonical/Shared", 0o755, mountStatus{Known: true}),
 		staticDiscovery("C", "/Canonical/C", "/Canonical/C", 0o755, mountStatus{Known: true}),
 		staticDiscovery("D", "/Canonical/D", "/Canonical/D", 0o755, mountStatus{Known: true}),
+		staticDiscovery("E", "", "", 0o755, mountStatus{Known: true}),
 	}
 	calls := make(map[string]int)
 	cache := collectCapabilityInspections(findings, discoveries, func(path string) fileCapabilityInspection {
 		calls[path]++
 		return fileCapabilityInspection{Known: true}
 	})
-	if len(cache) != 3 || calls["/Canonical/Shared"] != 2 || calls["/Canonical/D"] != 1 || calls["/Canonical/C"] != 0 {
+	if len(cache) != 3 || calls["/Canonical/Shared"] != 2 || calls["/Canonical/D"] != 1 || calls["/Canonical/C"] != 0 || calls[""] != 0 {
 		t.Fatalf("capability cache/calls = %#v/%v", cache, calls)
 	}
 	for _, name := range []string{"A", "B", "D"} {

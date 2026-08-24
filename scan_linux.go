@@ -1267,7 +1267,7 @@ func collectCapabilityInspections(findings []finding, discoveries []executableDi
 	result := make(map[string]fileCapabilityInspection)
 	for _, discovery := range discoveries {
 		name := discovery.CatalogName
-		if !discovery.Found || !discovery.Executable || name == "" || !needed[name] {
+		if !discovery.Found || !discovery.Executable || name == "" || !needed[name] || (!discovery.CapabilitiesInspected && discovery.CanonicalPath == "") {
 			continue
 		}
 		if _, cached := result[name]; !cached {
