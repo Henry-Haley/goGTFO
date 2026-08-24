@@ -1384,6 +1384,39 @@ func TestInspectExecutableFormatRequiresKnownHostMachine(t *testing.T) {
 	}
 }
 
+func TestInspectExecutableFormatUsesOpenedDescriptor(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "target")
+	validPath, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	validData, err := os.ReadFile(validPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, validData, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	replacement := filepath.Join(dir, "replacement")
+	if err := os.WriteFile(replacement, []byte("not an ELF"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatal(err)
+	}
+	machine, known := hostELFMachine()
+	got, err := inspectExecutableFormatFile(file, machine, known)
+	if err != nil || got != executableFormatELF {
+		t.Fatalf("opened descriptor classification = %v, %v; want ELF", got, err)
+	}
+}
+
 func TestInspectExecutableFormatRequiresLoadableSegment(t *testing.T) {
 	dir := t.TempDir()
 	noteOnly := filepath.Join(dir, "note-only")

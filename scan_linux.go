@@ -569,6 +569,10 @@ func inspectExecutableFormatForMachine(path string, expectedMachine elf.Machine,
 		return executableFormatUnknown, err
 	}
 	defer file.Close()
+	return inspectExecutableFormatFile(file, expectedMachine, knownHostMachine)
+}
+
+func inspectExecutableFormatFile(file *os.File, expectedMachine elf.Machine, knownHostMachine bool) (executableFormat, error) {
 	var header [4]byte
 	n, err := io.ReadFull(file, header[:])
 	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
@@ -578,7 +582,7 @@ func inspectExecutableFormatForMachine(path string, expectedMachine elf.Machine,
 		return executableFormatScript, nil
 	}
 	if n == len(header) && header[0] == 0x7f && header[1] == 'E' && header[2] == 'L' && header[3] == 'F' {
-		parsed, err := elf.Open(path)
+		parsed, err := elf.NewFile(file)
 		if err != nil {
 			return executableFormatMalformedELF, nil
 		}
