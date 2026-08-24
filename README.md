@@ -1,77 +1,82 @@
 # goGTFO
 
-> **Development status:** goGTFO is under active conversion and is not yet release-ready or suitable for use as a stable security tool.
+goGTFO is a Linux scanner for [GTFOBins](https://gtfobins.github.io/): it finds catalog executables available through `PATH` and evaluates their documented contexts against the local host. GTFOBins entries are documented techniques, not vulnerabilities.
 
-goGTFO is a Linux host scanner under active development that identifies installed GTFOBins executables and evaluates documented techniques against the host's unprivileged, SUID, file-capability, and sudo contexts, with MITRE ATT&CK mappings and example commands.
+Repository: `github.com/Henry-Haley/goGTFO`
 
-goGTFO is a Linux-focused adaptation of [goLoL](https://github.com/aaron-kidwell/goLoL), originally created by Aaron Kidwell.
-
-Maintainer: Henry Haley
-
-## Current development status
-
-- Phase 0 established the repository, conversion specification, Go 1.26.5 toolchain, and baseline.
-- Phase 1 established a Linux-only build and removed Windows console handling and LOLDrivers functionality.
-- The GTFOBins catalog model, live fetching, executable discovery, applicability evaluation, final output, tests, CI, and releases are still being implemented.
-- The `linux-gtfobins-port` branch is a development branch and must not yet be treated as a stable security tool.
-
-Any remaining legacy LOLBAS paths are temporary conversion scaffolding, not supported goGTFO functionality.
-
-## Planned functionality
-
-- Live retrieval of the official GTFOBins catalog.
-- PATH-based executable discovery.
-- Unprivileged-context findings.
-- SUID applicability analysis.
-- Linux file-capability analysis.
-- Sudo-policy evidence.
-- Alias and inheritance handling.
-- MITRE ATT&CK mappings.
-- Human-readable and structured output.
-- Explicit applicability states distinguishing `confirmed`, `potential`, `unknown`, and `unavailable` techniques.
-- Display-only handling of commands supplied by the GTFOBins catalog; catalog commands will never be executed.
-
-## Safety model
-
-goGTFO displays documented catalog techniques but does not execute them. It is intended only for authorized assessment, lab, and educational use and must be run only on systems you own or have explicit permission to assess.
-
-goGTFO is not an OPSEC-safe tool. A displayed technique is not a guarantee that the command will succeed because host policy, configuration, versions, and runtime conditions may still prevent it.
+goGTFO fetches the live official GTFOBins catalog when it runs. It never executes GTFOBins commands, examples, listeners, connectors, senders, or receivers; catalog commands are display-only data.
 
 ## Requirements
 
-- Linux.
-- Go 1.26.5.
-- Network access for future live GTFOBins catalog retrieval.
+- Linux
+- Go 1.26.5 to build from source
+- Network access to retrieve the live GTFOBins catalog
 
-## Development build
-
-There are no stable releases or packaged binaries yet. To build the current development branch:
+## Install
 
 ```bash
 git clone https://github.com/Henry-Haley/goGTFO.git
 cd goGTFO
-git switch linux-gtfobins-port
-go test ./...
 go build -o goGTFO .
 ```
 
-The resulting binary is a transitional development build, not a completed GTFOBins scanner.
+Or install directly:
 
-## Project status
+```bash
+go install github.com/Henry-Haley/goGTFO@latest
+```
 
-| Phase                                      | Status      |
-| ------------------------------------------ | ----------- |
-| Repository preparation and baseline        | Complete    |
-| Linux-only build conversion                | Complete    |
-| GTFOBins catalog models                    | Not started |
-| Live catalog client                        | Not started |
-| Executable discovery                       | Not started |
-| Alias and inheritance resolution           | Not started |
-| Host applicability inspection              | Not started |
-| Evaluation and rendering                   | Not started |
-| Final orchestration                        | Not started |
-| CI, documentation, and release preparation | Not started |
+## Usage
 
-## Disclaimer
+```bash
+./goGTFO
+./goGTFO -plain
+./goGTFO -s bash
+./goGTFO -plain -all -sort context
+```
 
-For authorized security testing, lab use, and education only. Run goGTFO only on systems you own or have explicit permission to assess. You are responsible for complying with applicable laws, policies, and rules of engagement. The project maintainers and original author are not responsible for misuse.
+Supported flags:
+
+| Flag | Meaning |
+| --- | --- |
+| `-h`, `-help` | Show help without fetching the catalog. |
+| `-plain` | Use ASCII-only presentation with no terminal control sequences. |
+| `-s name`, `-search name` | Show one catalog executable and every documented context. A directory prefix is ignored; names otherwise match exactly, or case-insensitively when unambiguous. |
+| `-sort mode` | Sort by `binary`, `context`, or `attack`. Aliases: `b`, `c`, `ctx`, `privilege`, `a`, and `mitre`. |
+| `-all` | Include unknown and unavailable contexts in a normal listing. |
+| `-check-sudo` | Run bounded, noninteractive `sudo -n -l <canonical-path>` policy checks. This may be logged by the host. |
+
+The `privilege` sort alias is retained only for command-line compatibility; it does not enable non-Linux behavior.
+
+## Discovery and applicability
+
+Discovery is PATH-only: goGTFO checks catalog executable names through `PATH` and evaluates the resolved executable. It does not recursively scan the filesystem, so binaries outside `PATH` are not discovered.
+
+Each documented context is reported as one of four states:
+
+| State | Meaning |
+| --- | --- |
+| `confirmed` | Available host evidence satisfies the context. |
+| `potential` | The available evidence is useful but does not prove the full technique can run. |
+| `unknown` | Evidence is incomplete, a version restriction is unverified, or goGTFO has no evaluator for a future catalog context. |
+| `unavailable` | A required executable or host condition is absent or safely blocked. |
+
+Normal listings show `confirmed` and `potential` contexts, plus counts for hidden `unknown` and `unavailable` contexts. `-all` shows every state. Search mode acts like `-all` for its selected executable.
+
+The Linux checks include executable and mount state, `noexec`, `nosuid`, `NoNewPrivs`, the process capability bounding set, root-owned SUID files, and file capabilities. These checks deliberately avoid overstating what can be proven from local metadata.
+
+Sudo is disabled by default. With `-check-sudo`, a recognized canonical executable path is still only `potential`: a path-policy listing cannot prove authorization for an entire GTFOBins command line. A failed or unavailable sudo probe remains `unknown`, rather than becoming `confirmed` or `unavailable` based solely on path policy.
+
+## Exit status
+
+| Code | Meaning |
+| --- | --- |
+| `0` | A successful listing, including a listing with zero confirmed results, or help. |
+| `1` | Catalog fetch, parsing, or validation failure; absent catalog search name; or selected executable absent from `PATH`. |
+| `2` | Invalid flag, unexpected argument, or invalid sort mode. |
+
+## Safety and authorization
+
+goGTFO is for authorized security testing, lab use, and education only. Run it only on systems you own or have explicit permission to assess. You are responsible for complying with applicable laws, policies, and rules of engagement.
+
+The GTFOBins catalog is maintained by the [GTFOBins project](https://gtfobins.github.io/). A displayed technique is not a guarantee that it will work: host policy, configuration, versions, and runtime conditions may prevent it.
