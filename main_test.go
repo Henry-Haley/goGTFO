@@ -952,6 +952,32 @@ func TestLocateTrustedSudoThroughTrustedDirectorySymlink(t *testing.T) {
 	}
 }
 
+func TestLocateTrustedSudoFromTrustedNonstandardDirectory(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root-owned disposable directory")
+	}
+	if _, err := os.Stat("/usr/bin/sudo"); err != nil {
+		t.Skipf("system sudo unavailable: %v", err)
+	}
+	dir, err := os.MkdirTemp("/opt", "gogtfo-sudo-")
+	if err != nil {
+		t.Skipf("trusted nonstandard directory unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	first := filepath.Join(dir, "sudo-first")
+	if err := os.Symlink("/usr/bin/sudo", first); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(first, filepath.Join(dir, "sudo")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	found, err := locateTrustedSudo()
+	if err != nil || found != "/usr/bin/sudo" {
+		t.Fatalf("trusted nonstandard sudo = %q, %v", found, err)
+	}
+}
+
 func writeTestExecutable(t *testing.T, dir, name string) string {
 	t.Helper()
 
