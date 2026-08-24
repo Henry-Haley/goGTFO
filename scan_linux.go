@@ -309,6 +309,10 @@ func parseProcStatus(r io.Reader) (procStatus, []string) {
 		warnings = append(warnings, "CapBnd is missing")
 	}
 	if err := scanner.Err(); err != nil {
+		status.NoNewPrivs = false
+		status.NoNewPrivsKnown = false
+		status.CapBnd = 0
+		status.CapBndKnown = false
 		warnings = append(warnings, fmt.Sprintf("read process status: %v", err))
 	}
 	return status, warnings

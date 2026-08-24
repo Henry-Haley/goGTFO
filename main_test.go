@@ -639,6 +639,17 @@ func TestParseProcStatusRejectsDuplicateSecurityFields(t *testing.T) {
 	}
 }
 
+func TestParseProcStatusReadFailurePoisonsSecurityFields(t *testing.T) {
+	input := "NoNewPrivs: 0\nCapBnd: ff\n" + strings.Repeat("x", 128*1024) + "\n"
+	status, warnings := parseProcStatus(strings.NewReader(input))
+	if status.NoNewPrivsKnown || status.CapBndKnown {
+		t.Fatalf("read failure retained trusted security fields: %#v", status)
+	}
+	if !warningContains(warnings, "read process status") {
+		t.Fatalf("warnings = %v; want scanner failure warning", warnings)
+	}
+}
+
 func TestSearchCatalogName(t *testing.T) {
 	executables := map[string]executableDef{
 		"Tool":      {},
