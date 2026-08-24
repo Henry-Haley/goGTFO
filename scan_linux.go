@@ -595,6 +595,8 @@ func hostELFMachine() (elf.Machine, bool) {
 		return elf.EM_RISCV, true
 	case "s390x":
 		return elf.EM_S390, true
+	case "loong64":
+		return elf.EM_LOONGARCH, true
 	default:
 		return 0, false
 	}
