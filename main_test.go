@@ -1426,8 +1426,29 @@ func TestInspectExecutableFormatRejectsWrongEndianness(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "wrong-endian")
 	writeELFProgramHeaderFixtureMachineData(t, path, elf.EM_X86_64, elf.ELFDATA2MSB, elf.PT_LOAD)
-	if got, err := inspectExecutableFormatForArchitecture(path, elf.EM_X86_64, elf.ELFDATA2LSB, true); err != nil || got != executableFormatUnknown {
+	if got, err := inspectExecutableFormatForArchitecture(path, elf.EM_X86_64, elf.ELFDATA2LSB, elf.ELFCLASS64, true); err != nil || got != executableFormatUnknown {
 		t.Fatalf("wrong-endian ELF = %v, %v; want unknown", got, err)
+	}
+}
+
+func TestInspectExecutableFormatRejectsWrongClass(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wrong-class")
+	data := make([]byte, 52+32)
+	copy(data, []byte{0x7f, 'E', 'L', 'F', 1, 1, 1})
+	binary.LittleEndian.PutUint16(data[16:18], uint16(elf.ET_DYN))
+	binary.LittleEndian.PutUint16(data[18:20], uint16(elf.EM_X86_64))
+	binary.LittleEndian.PutUint32(data[20:24], 1)
+	binary.LittleEndian.PutUint32(data[28:32], 52)
+	binary.LittleEndian.PutUint16(data[40:42], 52)
+	binary.LittleEndian.PutUint16(data[42:44], 32)
+	binary.LittleEndian.PutUint16(data[44:46], 1)
+	binary.LittleEndian.PutUint32(data[52:56], uint32(elf.PT_LOAD))
+	if err := os.WriteFile(path, data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := inspectExecutableFormatForArchitecture(path, elf.EM_X86_64, elf.ELFDATA2LSB, elf.ELFCLASS64, true); err != nil || got != executableFormatUnknown {
+		t.Fatalf("wrong-class ELF = %v, %v; want unknown", got, err)
 	}
 }
 
@@ -1458,7 +1479,7 @@ func TestInspectExecutableFormatUsesOpenedDescriptor(t *testing.T) {
 		t.Fatal(err)
 	}
 	machine, known := hostELFMachine()
-	got, err := inspectExecutableFormatFile(file, machine, elf.ELFDATANONE, known)
+	got, err := inspectExecutableFormatFile(file, machine, elf.ELFDATANONE, elf.ELFCLASSNONE, known)
 	if err != nil || got != executableFormatELF {
 		t.Fatalf("opened descriptor classification = %v, %v; want ELF", got, err)
 	}
