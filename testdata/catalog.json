@@ -5,9 +5,11 @@
       "description": "Runs a harmless fixture command.",
       "mitre": ["T0001", "T0002"],
       "extra": {
-        "fixture-listener": {
-          "comment": "Synthetic shared companion.",
-          "code": "echo fixture"
+        "listener": {
+          "fixture-listener": {
+            "comment": "Synthetic shared companion.",
+            "code": "echo fixture"
+          }
         }
       },
       "future_function_field": "ignored"

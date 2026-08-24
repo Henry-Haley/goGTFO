@@ -504,7 +504,17 @@ func resolveCompanions(function functionMeta, example exampleDef, executableName
 
 		var value *companionMeta
 		if definition.Reference != "" {
-			raw, ok := function.Extra[definition.Reference]
+			roleRaw, ok := function.Extra[role.name]
+			if !ok {
+				warnings = append(warnings, fmt.Sprintf("catalog executable %q function %q context %q companion %s metadata is missing", executableName, functionKey, contextKey, role.name))
+				continue
+			}
+			var references map[string]json.RawMessage
+			if err := json.Unmarshal(roleRaw, &references); err != nil {
+				warnings = append(warnings, fmt.Sprintf("catalog executable %q function %q context %q companion %s metadata is malformed", executableName, functionKey, contextKey, role.name))
+				continue
+			}
+			raw, ok := references[definition.Reference]
 			if !ok {
 				warnings = append(warnings, fmt.Sprintf("catalog executable %q function %q context %q companion %s reference %q is missing", executableName, functionKey, contextKey, role.name, definition.Reference))
 				continue

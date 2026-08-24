@@ -255,13 +255,17 @@ func TestResolveAllCompanionRoles(t *testing.T) {
 				Contexts:  map[string]json.RawMessage{"unprivileged": json.RawMessage("null")},
 				Listener:  json.RawMessage(`"shared"`),
 				Connector: json.RawMessage(`{"comment":"connector-comment","code":"connector-code"}`),
-				Sender:    json.RawMessage(`{"comment":"sender-comment","code":"sender-code"}`),
-				Receiver:  json.RawMessage(`{"comment":"receiver-comment","code":"receiver-code"}`),
+				Sender:    json.RawMessage(`"sender"`),
+				Receiver:  json.RawMessage(`"receiver"`),
 			}},
 		}},
 	})
 	meta := c.Functions["command"]
-	meta.Extra = map[string]json.RawMessage{"shared": json.RawMessage(`{"comment":"listener-comment","code":"listener-code"}`)}
+	meta.Extra = map[string]json.RawMessage{
+		"listener": json.RawMessage(`{"shared":{"comment":"listener-comment","code":"listener-code"}}`),
+		"sender":   json.RawMessage(`{"sender":{"comment":"sender-comment","code":"sender-code"}}`),
+		"receiver": json.RawMessage(`{"receiver":{"comment":"receiver-comment","code":"receiver-code"}}`),
+	}
 	c.Functions["command"] = meta
 
 	value := techniqueNamed(t, findingNamed(t, resolveCatalog(c), "tool"), "command", "unprivileged")
@@ -279,6 +283,34 @@ func TestResolveAllCompanionRoles(t *testing.T) {
 	}
 }
 
+func TestResolvedCompanionDoesNotHideApplicableTechnique(t *testing.T) {
+	c := basicResolutionCatalog(map[string]executableDef{
+		"tool": {Functions: map[string][]exampleDef{
+			"command": {{
+				Code:     "primary-code",
+				Contexts: map[string]json.RawMessage{"unprivileged": json.RawMessage("null")},
+				Listener: json.RawMessage(`"shared"`),
+			}},
+		}},
+	})
+	meta := c.Functions["command"]
+	meta.Extra = map[string]json.RawMessage{"listener": json.RawMessage(`{"shared":{"code":"listener-code"}}`)}
+	c.Functions["command"] = meta
+
+	resolved := resolveCatalog(c)
+	value := findingNamed(t, resolved, "tool")
+	evaluated := evaluateFindings([]finding{value}, []executableDiscovery{
+		staticDiscovery("tool", "/fixture/tool", "/fixture/tool", 0o755, mountStatus{Known: true}),
+	}, hostSnapshot{procStatus: procStatus{NoNewPrivsKnown: true, CapBndKnown: true}}, sudoProbeBatch{}, nil)
+	report := filterFindings(evaluated, false)
+	if report.DisplayedTechniques != 1 || report.HiddenUnknown != 0 || len(report.Findings) != 1 {
+		t.Fatalf("valid companion was hidden: %#v", report)
+	}
+	if got := report.Findings[0].Techniques[0]; got.State != stateConfirmed || len(got.Companions) != 1 || len(got.Warnings) != 0 {
+		t.Fatalf("applicability = %#v", got)
+	}
+}
+
 func TestResolveInvalidCompanionsWarnButKeepTechnique(t *testing.T) {
 	c := basicResolutionCatalog(map[string]executableDef{
 		"tool": {Functions: map[string][]exampleDef{
@@ -291,7 +323,10 @@ func TestResolveInvalidCompanionsWarnButKeepTechnique(t *testing.T) {
 		}},
 	})
 	meta := c.Functions["command"]
-	meta.Extra = map[string]json.RawMessage{"malformed": json.RawMessage(`{"code":1}`)}
+	meta.Extra = map[string]json.RawMessage{
+		"listener":  json.RawMessage(`{"other":{"code":"other"}}`),
+		"connector": json.RawMessage(`{"malformed":{"code":1}}`),
+	}
 	c.Functions["command"] = meta
 
 	result := resolveCatalog(c)
