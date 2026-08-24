@@ -1144,6 +1144,10 @@ func evaluateContext(contextKey string, contextList []string, version string, di
 	case "capabilities":
 		// GTFOBins has no structured field proving that a technique works without
 		// effective file capabilities, so the first release requires the flag.
+		xattr := capabilities[discovery.CatalogName]
+		if discovery.CapabilitiesInspected {
+			xattr = discovery.Capabilities
+		}
 		return composeApplicabilityResults(common, evaluateCapabilities(capabilityEvaluationInput{
 			FileInspected:        fileInspected,
 			Regular:              regular,
@@ -1156,7 +1160,7 @@ func evaluateContext(contextKey string, contextList []string, version string, di
 			CapBndKnown:          host.CapBndKnown,
 			CapBnd:               host.CapBnd,
 			Required:             parseRequiredCapabilities(contextList),
-			Xattr:                capabilities[discovery.CanonicalPath],
+			Xattr:                xattr,
 			RequireEffective:     true,
 			Version:              version,
 		}))
@@ -1262,15 +1266,15 @@ func collectCapabilityInspections(findings []finding, discoveries []executableDi
 
 	result := make(map[string]fileCapabilityInspection)
 	for _, discovery := range discoveries {
-		path := discovery.CanonicalPath
-		if !discovery.Found || !discovery.Executable || path == "" || !needed[discovery.CatalogName] {
+		name := discovery.CatalogName
+		if !discovery.Found || !discovery.Executable || name == "" || !needed[name] {
 			continue
 		}
-		if _, cached := result[path]; !cached {
+		if _, cached := result[name]; !cached {
 			if discovery.CapabilitiesInspected {
-				result[path] = discovery.Capabilities
+				result[name] = discovery.Capabilities
 			} else {
-				result[path] = inspect(path)
+				result[name] = inspect(discovery.CanonicalPath)
 			}
 		}
 	}
