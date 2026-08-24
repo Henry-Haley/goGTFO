@@ -42,6 +42,7 @@ const (
 	vfsCapabilityRevision2     uint32 = 0x02000000
 	vfsCapabilityRevision3     uint32 = 0x03000000
 	vfsCapabilityEffective     uint32 = 0x00000001
+	vfsCapabilityKnownFlags    uint32 = vfsCapabilityRevisionMask | vfsCapabilityEffective
 	vfsCapabilityRevision2Size        = 20
 	vfsCapabilityRevision3Size        = 24
 	sudoProbeBudget                   = 20 * time.Second
@@ -772,6 +773,9 @@ func decodeFileCapabilities(data []byte) (fileCapabilities, error) {
 
 	magic := binary.LittleEndian.Uint32(data[:4])
 	revision := magic & vfsCapabilityRevisionMask
+	if magic&^vfsCapabilityKnownFlags != 0 {
+		return fileCapabilities{}, fmt.Errorf("security.capability has unsupported flags 0x%08x", magic&^vfsCapabilityKnownFlags)
+	}
 	wantLength := 0
 	switch revision {
 	case vfsCapabilityRevision2:

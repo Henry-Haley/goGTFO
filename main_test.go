@@ -1473,6 +1473,7 @@ func TestDecodeFileCapabilitiesRejectsMalformedData(t *testing.T) {
 		{"empty", nil, "truncated"},
 		{"short magic", []byte{1, 2, 3}, "truncated"},
 		{"unknown revision", unknown, "unsupported security.capability revision"},
+		{"unknown flags", append([]byte{0x03, 0x00, 0x00, 0x02}, revision2[4:]...), "unsupported flags"},
 		{"overlong revision 2", append(revision2, 0), "has length 21, want 20"},
 		{"overlong revision 3", append(revision3, 0), "has length 25, want 24"},
 	}
