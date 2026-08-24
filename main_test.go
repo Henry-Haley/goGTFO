@@ -932,6 +932,26 @@ func TestLocateTrustedSudoRejectsSymlinkAndWritableCandidates(t *testing.T) {
 	}
 }
 
+func TestLocateTrustedSudoThroughTrustedDirectorySymlink(t *testing.T) {
+	if _, err := os.Stat("/usr/bin/sudo"); err != nil {
+		t.Skipf("system sudo unavailable: %v", err)
+	}
+	dir := t.TempDir()
+	first := filepath.Join(dir, "first")
+	second := filepath.Join(dir, "second")
+	if err := os.Symlink("/usr/bin", first); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(first, second); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", second)
+	found, err := locateTrustedSudo()
+	if err != nil || found != "/usr/bin/sudo" {
+		t.Fatalf("trusted directory symlink chain = %q, %v", found, err)
+	}
+}
+
 func writeTestExecutable(t *testing.T, dir, name string) string {
 	t.Helper()
 
