@@ -230,6 +230,7 @@ func parseProcStatus(r io.Reader) (procStatus, []string) {
 	var status procStatus
 	var warnings []string
 	var sawNoNewPrivs, sawCapBnd bool
+	var duplicateNoNewPrivs, duplicateCapBnd bool
 
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
@@ -240,6 +241,15 @@ func parseProcStatus(r io.Reader) (procStatus, []string) {
 		fields := strings.Fields(raw)
 		switch strings.TrimSpace(name) {
 		case "NoNewPrivs":
+			if sawNoNewPrivs {
+				status.NoNewPrivs = false
+				status.NoNewPrivsKnown = false
+				if !duplicateNoNewPrivs {
+					warnings = append(warnings, "NoNewPrivs is duplicated")
+				}
+				duplicateNoNewPrivs = true
+				continue
+			}
 			sawNoNewPrivs = true
 			if len(fields) != 1 {
 				status.NoNewPrivsKnown = false
@@ -255,6 +265,15 @@ func parseProcStatus(r io.Reader) (procStatus, []string) {
 			status.NoNewPrivs = value == 1
 			status.NoNewPrivsKnown = true
 		case "CapBnd":
+			if sawCapBnd {
+				status.CapBnd = 0
+				status.CapBndKnown = false
+				if !duplicateCapBnd {
+					warnings = append(warnings, "CapBnd is duplicated")
+				}
+				duplicateCapBnd = true
+				continue
+			}
 			sawCapBnd = true
 			if len(fields) != 1 {
 				status.CapBndKnown = false

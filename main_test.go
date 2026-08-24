@@ -609,6 +609,35 @@ func TestParseProcStatus(t *testing.T) {
 	}
 }
 
+func TestParseProcStatusRejectsDuplicateSecurityFields(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  procStatus
+		warn  string
+	}{
+		{"valid NoNewPrivs values", "NoNewPrivs: 0\nNoNewPrivs: 1\nCapBnd: ff\n", procStatus{CapBnd: 0xff, CapBndKnown: true}, "NoNewPrivs is duplicated"},
+		{"identical NoNewPrivs values", "NoNewPrivs: 1\nCapBnd: ff\nNoNewPrivs: 1\n", procStatus{CapBnd: 0xff, CapBndKnown: true}, "NoNewPrivs is duplicated"},
+		{"valid CapBnd values", "NoNewPrivs: 0\nCapBnd: ff\nCapBnd: 0\n", procStatus{NoNewPrivsKnown: true}, "CapBnd is duplicated"},
+		{"valid then malformed", "NoNewPrivs: 0\nNoNewPrivs: bad\nCapBnd: ff\n", procStatus{CapBnd: 0xff, CapBndKnown: true}, "NoNewPrivs is duplicated"},
+		{"malformed then valid", "NoNewPrivs: bad\nCapBnd: ff\nNoNewPrivs: 0\n", procStatus{CapBnd: 0xff, CapBndKnown: true}, "NoNewPrivs is duplicated"},
+		{"malformed twice", "NoNewPrivs: bad\nNoNewPrivs: worse\nCapBnd: ff\n", procStatus{CapBnd: 0xff, CapBndKnown: true}, "NoNewPrivs is duplicated"},
+		{"more than two", "NoNewPrivs: 0\nName: fixture\nNoNewPrivs: 1\nNoNewPrivs: 0\nCapBnd: ff\n", procStatus{CapBnd: 0xff, CapBndKnown: true}, "NoNewPrivs is duplicated"},
+		{"CapBnd separated", "NoNewPrivs: 0\nCapBnd: ff\nName: fixture\nCapBnd: 0\n", procStatus{NoNewPrivsKnown: true}, "CapBnd is duplicated"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, warnings := parseProcStatus(strings.NewReader(tt.input))
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("status = %#v, want %#v", got, tt.want)
+			}
+			if !warningContains(warnings, tt.warn) {
+				t.Fatalf("warnings = %v, want %q", warnings, tt.warn)
+			}
+		})
+	}
+}
+
 func TestSearchCatalogName(t *testing.T) {
 	executables := map[string]executableDef{
 		"Tool":      {},
