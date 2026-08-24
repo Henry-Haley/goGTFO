@@ -1258,6 +1258,16 @@ func TestEvaluateCapabilities(t *testing.T) {
 		evidence string
 	}{
 		{"fully satisfied", func(*capabilityEvaluationInput) {}, stateConfirmed, ""},
+		{"V3 namespace root ID is conservative", func(input *capabilityEvaluationInput) {
+			input.Xattr.Capabilities.Revision = vfsCapabilityRevision3
+			input.Xattr.Capabilities.RootID = 4242
+			input.Xattr.Capabilities.HasRootID = true
+		}, stateUnknown, "V3 file capability namespace root ID compatibility could not be verified"},
+		{"V3 missing capability still unavailable", func(input *capabilityEvaluationInput) {
+			input.Xattr.Capabilities.Revision = vfsCapabilityRevision3
+			input.Xattr.Capabilities.HasRootID = true
+			input.Xattr.Capabilities.Permitted &^= uint64(1) << unix.CAP_SETUID
+		}, stateUnavailable, "CAP_SETUID is missing from file permitted set"},
 		{"required permitted bit absent", func(input *capabilityEvaluationInput) {
 			input.Xattr.Capabilities.Permitted &^= uint64(1) << unix.CAP_SETUID
 		}, stateUnavailable, "CAP_SETUID is missing from file permitted set"},

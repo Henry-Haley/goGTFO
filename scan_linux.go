@@ -843,6 +843,10 @@ func evaluateCapabilities(input capabilityEvaluationInput) applicabilityResult {
 			states = append(states, stateUnavailable)
 			evidence = append(evidence, "file capability effective flag is not set")
 		}
+		if input.Xattr.Capabilities.Revision == vfsCapabilityRevision3 && input.Xattr.Capabilities.HasRootID {
+			states = append(states, stateUnknown)
+			evidence = append(evidence, "V3 file capability namespace root ID compatibility could not be verified")
+		}
 	}
 
 	if !input.CapBndKnown {
