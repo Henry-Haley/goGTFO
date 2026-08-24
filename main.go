@@ -616,8 +616,8 @@ func renderTechnique(index int, value technique) {
 	if value.Version != "" {
 		printField("Version restriction", value.Version)
 	}
-	if value.ContextShell != "" {
-		printField("Context shell", value.ContextShell)
+	if value.ContextShell != nil {
+		printField("Context shell", fmt.Sprint(*value.ContextShell))
 	}
 	if len(value.ContextList) != 0 {
 		printField("Context requirements", strings.Join(value.ContextList, ", "))
@@ -640,8 +640,8 @@ func renderTechnique(index int, value technique) {
 		if launcher.Version != "" {
 			printField(prefix+" version", launcher.Version)
 		}
-		if launcher.ContextShell != "" {
-			printField(prefix+" shell", launcher.ContextShell)
+		if launcher.ContextShell != nil {
+			printField(prefix+" shell", fmt.Sprint(*launcher.ContextShell))
 		}
 		if len(launcher.ContextList) != 0 {
 			printField(prefix+" requirements", strings.Join(launcher.ContextList, ", "))

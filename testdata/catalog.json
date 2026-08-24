@@ -63,7 +63,7 @@
                 "comment": "Synthetic context-specific override."
               },
               "suid": {
-                "shell": "fixture-shell"
+                "shell": true
               },
               "capabilities": {
                 "list": ["CAP_FIXTURE"]

@@ -62,7 +62,7 @@ type exampleDef struct {
 type contextDef struct {
 	Code    string   `json:"code"`
 	Comment string   `json:"comment"`
-	Shell   string   `json:"shell"`
+	Shell   *bool    `json:"shell"`
 	List    []string `json:"list"`
 }
 
@@ -105,7 +105,7 @@ type technique struct {
 	ExampleComment     string
 	ContextComment     string
 	Version            string
-	ContextShell       string
+	ContextShell       *bool
 	ContextList        []string
 	Blind              *bool
 	TTY                *bool
@@ -131,7 +131,7 @@ type launcherStep struct {
 	ExampleComment string
 	ContextComment string
 	Version        string
-	ContextShell   string
+	ContextShell   *bool
 	ContextList    []string
 	Blind          *bool
 	TTY            *bool
@@ -141,7 +141,7 @@ type launcherStep struct {
 type resolvedContext struct {
 	Code    string
 	Comment string
-	Shell   string
+	Shell   *bool
 	List    []string
 }
 

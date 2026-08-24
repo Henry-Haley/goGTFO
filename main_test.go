@@ -136,7 +136,7 @@ func TestResolveCatalogFixture(t *testing.T) {
 		t.Fatalf("context override = %#v", sudo)
 	}
 	suid := techniqueNamed(t, tool, "command", "suid")
-	if suid.Code != "fixture-command --example" || suid.ContextShell != "fixture-shell" {
+	if suid.Code != "fixture-command --example" || suid.ContextShell == nil || !*suid.ContextShell {
 		t.Fatalf("SUID context = %#v", suid)
 	}
 	capabilities := techniqueNamed(t, tool, "command", "capabilities")
@@ -288,7 +288,7 @@ func TestResolvedCompanionDoesNotHideApplicableTechnique(t *testing.T) {
 		"tool": {Functions: map[string][]exampleDef{
 			"command": {{
 				Code:     "primary-code",
-				Contexts: map[string]json.RawMessage{"unprivileged": json.RawMessage("null")},
+				Contexts: map[string]json.RawMessage{"unprivileged": json.RawMessage(`{"shell":true}`)},
 				Listener: json.RawMessage(`"shared"`),
 			}},
 		}},
@@ -358,7 +358,7 @@ func TestResolveInheritanceMetadataAndContextIntersection(t *testing.T) {
 					Comment: "target-example-comment",
 					Version: "target-version",
 					Contexts: map[string]json.RawMessage{
-						"unprivileged": json.RawMessage(`{"comment":"target-context-comment","shell":"target-shell","list":["TARGET"]}`),
+						"unprivileged": json.RawMessage(`{"comment":"target-context-comment","shell":true,"list":["TARGET"]}`),
 						"sudo":         json.RawMessage("null"),
 						"future":       json.RawMessage("null"),
 					},
@@ -371,7 +371,7 @@ func TestResolveInheritanceMetadataAndContextIntersection(t *testing.T) {
 					Version: "launcher-version",
 					From:    "target",
 					Contexts: map[string]json.RawMessage{
-						"unprivileged": json.RawMessage(`{"code":"launcher-override","comment":"launcher-context-comment","shell":"launcher-shell","list":["LAUNCH"]}`),
+						"unprivileged": json.RawMessage(`{"code":"launcher-override","comment":"launcher-context-comment","shell":false,"list":["LAUNCH"]}`),
 						"future":       json.RawMessage("null"),
 					},
 				}},
@@ -397,14 +397,14 @@ func TestResolveInheritanceMetadataAndContextIntersection(t *testing.T) {
 	if value.Code != "target-code" || value.ExampleComment != "target-example-comment" || value.ContextComment != "target-context-comment" || value.Version != "target-version" {
 		t.Fatalf("target metadata = %#v", value)
 	}
-	if value.Description != "target-description" || !reflect.DeepEqual(value.MitreIDs, []string{"T1000", "T2000"}) || value.ContextShell != "target-shell" || !reflect.DeepEqual(value.ContextList, []string{"TARGET"}) {
+	if value.Description != "target-description" || !reflect.DeepEqual(value.MitreIDs, []string{"T1000", "T2000"}) || value.ContextShell == nil || !*value.ContextShell || !reflect.DeepEqual(value.ContextList, []string{"TARGET"}) {
 		t.Fatalf("target function/context metadata = %#v", value)
 	}
 	if len(value.Launchers) != 1 {
 		t.Fatalf("launchers = %#v", value.Launchers)
 	}
 	launcher := value.Launchers[0]
-	if launcher.Code != "launcher-override" || launcher.ExampleComment != "launcher-example-comment" || launcher.ContextComment != "launcher-context-comment" || launcher.Version != "launcher-version" || launcher.ContextShell != "launcher-shell" || !reflect.DeepEqual(launcher.ContextList, []string{"LAUNCH"}) {
+	if launcher.Code != "launcher-override" || launcher.ExampleComment != "launcher-example-comment" || launcher.ContextComment != "launcher-context-comment" || launcher.Version != "launcher-version" || launcher.ContextShell == nil || *launcher.ContextShell || !reflect.DeepEqual(launcher.ContextList, []string{"LAUNCH"}) {
 		t.Fatalf("launcher metadata = %#v", launcher)
 	}
 	if strings.Contains(value.Code, launcher.Code) || strings.Contains(launcher.Code, value.Code) {
@@ -2570,15 +2570,77 @@ func TestDecodeContext(t *testing.T) {
 		t.Fatalf("null context = %#v, %v", value, err)
 	}
 
-	value, err = decodeContext(json.RawMessage(`{"code":"fixture-command --example","comment":"fixture","shell":"fixture-shell","list":["CAP_FIXTURE"]}`))
-	if err != nil || value.Code == "" || value.Comment == "" || value.Shell == "" || len(value.List) != 1 {
+	value, err = decodeContext(json.RawMessage(`{"code":"fixture-command --example","comment":"fixture","shell":true,"list":["CAP_FIXTURE"]}`))
+	if err != nil || value.Code == "" || value.Comment == "" || value.Shell == nil || !*value.Shell || len(value.List) != 1 {
 		t.Fatalf("object context = %#v, %v", value, err)
 	}
+	for _, raw := range []string{`{"shell":false}`, `{}`, `null`} {
+		value, err := decodeContext(json.RawMessage(raw))
+		if err != nil {
+			t.Fatalf("decodeContext(%s): %v", raw, err)
+		}
+		if raw == `{"shell":false}` && (value == nil || value.Shell == nil || *value.Shell) {
+			t.Fatalf("false shell metadata was not preserved: %#v", value)
+		}
+		if raw != `{"shell":false}` && value != nil && value.Shell != nil {
+			t.Fatalf("missing/null shell metadata was not preserved: %#v", value)
+		}
+	}
 
-	for _, raw := range []string{``, `[]`, `"context"`, `1`, `true`, `{`, `{"code":1}`} {
+	for _, raw := range []string{``, `[]`, `"context"`, `1`, `true`, `{`, `{"code":1}`, `{"shell":"true"}`, `{"shell":1}`, `{"shell":{}}`, `{"shell":[]}`} {
 		if _, err := decodeContext(json.RawMessage(raw)); err == nil {
 			t.Errorf("decodeContext(%q) succeeded", raw)
 		}
+	}
+}
+
+func TestBooleanContextShellReachesEvaluationAndRendering(t *testing.T) {
+	c := basicResolutionCatalog(map[string]executableDef{
+		"tool": {Functions: map[string][]exampleDef{
+			"command": {{
+				Code: "fixture-code",
+				Contexts: map[string]json.RawMessage{
+					"unprivileged": json.RawMessage(`{"shell":true}`),
+					"sudo":         json.RawMessage(`{"shell":false}`),
+					"suid":         json.RawMessage(`{}`),
+				},
+			}},
+		}},
+	})
+	c.Contexts["suid"] = contextMeta{Label: "SUID"}
+	result := resolveCatalog(c)
+	if len(result.Warnings) != 0 {
+		t.Fatalf("boolean shell metadata produced warnings: %v", result.Warnings)
+	}
+	value := findingNamed(t, result, "tool")
+	for _, key := range []string{"unprivileged", "sudo", "suid"} {
+		candidate := techniqueNamed(t, value, "command", key)
+		if candidate.ContextKey != key {
+			t.Fatalf("context %q was not retained: %#v", key, candidate)
+		}
+	}
+	if candidate := techniqueNamed(t, value, "command", "unprivileged"); candidate.ContextShell == nil || !*candidate.ContextShell {
+		t.Fatalf("true shell metadata lost: %#v", candidate)
+	}
+	if candidate := techniqueNamed(t, value, "command", "sudo"); candidate.ContextShell == nil || *candidate.ContextShell {
+		t.Fatalf("false shell metadata lost: %#v", candidate)
+	}
+
+	tool := value
+	tool.Techniques = []technique{techniqueNamed(t, value, "command", "unprivileged"), techniqueNamed(t, value, "command", "sudo")}
+	evaluated := evaluateFindings([]finding{tool}, []executableDiscovery{
+		staticDiscovery("tool", "/fixture/tool", "/fixture/tool", 0o755, mountStatus{Known: true}),
+	}, hostSnapshot{procStatus: procStatus{NoNewPrivsKnown: true, CapBndKnown: true}}, sudoProbeBatch{}, nil)
+	report := filterFindings(evaluated, true)
+	if report.DisplayedTechniques != 2 {
+		t.Fatalf("boolean shell techniques were not rendered: %#v", report)
+	}
+	previous := plainMode
+	defer func() { plainMode = previous }()
+	plainMode = true
+	output := captureProcessOutput(t, func() { renderReport(report) })
+	if !strings.Contains(output, "Context shell:         true") || !strings.Contains(output, "Context shell:         false") {
+		t.Fatalf("boolean shell metadata missing from output: %s", output)
 	}
 }
 
