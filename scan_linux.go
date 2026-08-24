@@ -630,10 +630,10 @@ func parseRequiredCapabilities(names []string) requiredCapabilities {
 	var result requiredCapabilities
 	unknown := make(map[string]bool)
 	for _, name := range names {
-		canonical := strings.ToUpper(name)
+		canonical := strings.ToUpper(strings.TrimSpace(name))
 		bit, ok := linuxCapabilityBits[canonical]
 		if !ok {
-			unknown[name] = true
+			unknown[canonical] = true
 			continue
 		}
 		result.Mask |= uint64(1) << bit

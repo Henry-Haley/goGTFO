@@ -1098,6 +1098,7 @@ func TestParseRequiredCapabilities(t *testing.T) {
 		{"canonical", []string{"CAP_SETUID"}, []string{"CAP_SETUID"}, uint64(1) << unix.CAP_SETUID, nil, true},
 		{"lowercase", []string{"cap_setuid"}, []string{"CAP_SETUID"}, uint64(1) << unix.CAP_SETUID, nil, true},
 		{"mixed case", []string{"Cap_Setuid"}, []string{"CAP_SETUID"}, uint64(1) << unix.CAP_SETUID, nil, true},
+		{"surrounding whitespace", []string{" CAP_SETUID ", "\tCAP_BPF\n"}, []string{"CAP_BPF", "CAP_SETUID"}, uint64(1)<<unix.CAP_SETUID | uint64(1)<<unix.CAP_BPF, nil, true},
 		{"modern high bit", []string{"CAP_BPF"}, []string{"CAP_BPF"}, highMask, nil, true},
 		{"multiple", []string{"CAP_SETUID", "CAP_CHOWN"}, []string{"CAP_CHOWN", "CAP_SETUID"}, 1 | uint64(1)<<unix.CAP_SETUID, nil, true},
 		{"duplicates", []string{"CAP_SETUID", "cap_setuid"}, []string{"CAP_SETUID"}, uint64(1) << unix.CAP_SETUID, nil, true},
