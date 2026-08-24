@@ -951,6 +951,7 @@ func staticDiscovery(name, invocable, canonical string, mode os.FileMode, mount 
 		CanonicalPath: canonical,
 		FileInfo:      staticFileInfo{name: filepath.Base(canonical), mode: mode},
 		Executable:    mode.Perm()&0o111 != 0,
+		Format:        executableFormatELF,
 		Mount:         mount,
 		Usable:        discoveryUsable(mode.Perm()&0o111 != 0, mount),
 	}
@@ -977,6 +978,7 @@ func validSUIDEvaluationInput() suidEvaluationInput {
 	return suidEvaluationInput{
 		FileInspected:   true,
 		Regular:         true,
+		Format:          executableFormatELF,
 		Mode:            0o755 | os.ModeSetuid,
 		OwnerUIDKnown:   true,
 		Mount:           mountStatus{Known: true},
@@ -1005,6 +1007,8 @@ func TestEvaluateSUID(t *testing.T) {
 		{"setuid absent outranks version", func(input *suidEvaluationInput) { input.Mode &^= os.ModeSetuid; input.Version = "fixture <= 1" }, stateUnavailable, "does not have setuid bit"},
 		{"NoNewPrivs outranks unknown mount", func(input *suidEvaluationInput) { input.NoNewPrivs = true; input.Mount.Known = false }, stateUnavailable, "NoNewPrivs is enabled"},
 		{"file inspection unknown", func(input *suidEvaluationInput) { input.FileInspected = false }, stateUnknown, "file information could not be determined"},
+		{"interpreter script", func(input *suidEvaluationInput) { input.Format = executableFormatScript }, stateUnavailable, "interpreter scripts ignore the setuid bit"},
+		{"format unknown", func(input *suidEvaluationInput) { input.Format = executableFormatUnknown }, stateUnknown, "executable format could not be verified"},
 	}
 
 	for _, tt := range tests {
@@ -1025,6 +1029,28 @@ func TestEvaluateSUID(t *testing.T) {
 				t.Fatalf("evidence order changed: first %v, second %v", got.Evidence, again.Evidence)
 			}
 		})
+	}
+}
+
+func TestInspectExecutableFormat(t *testing.T) {
+	dir := t.TempDir()
+	elf := filepath.Join(dir, "elf")
+	if err := os.WriteFile(elf, []byte{0x7f, 'E', 'L', 'F', 2}, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(dir, "script")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\necho fixture\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(dir, "other")
+	if err := os.WriteFile(other, []byte("fixture"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]executableFormat{elf: executableFormatELF, script: executableFormatScript, other: executableFormatUnknown} {
+		got, err := inspectExecutableFormat(path)
+		if err != nil || got != want {
+			t.Fatalf("inspectExecutableFormat(%q) = %v, %v; want %v", path, got, err, want)
+		}
 	}
 }
 

@@ -84,6 +84,7 @@ type sudoRunner func(context.Context, string, string) error
 type suidEvaluationInput struct {
 	FileInspected   bool
 	Regular         bool
+	Format          executableFormat
 	Mode            os.FileMode
 	OwnerUIDKnown   bool
 	OwnerUID        uint32
@@ -92,6 +93,14 @@ type suidEvaluationInput struct {
 	NoNewPrivs      bool
 	Version         string
 }
+
+type executableFormat uint8
+
+const (
+	executableFormatUnknown executableFormat = iota
+	executableFormatELF
+	executableFormatScript
+)
 
 type fileCapabilities struct {
 	Revision    uint32
@@ -204,6 +213,7 @@ type executableDiscovery struct {
 	CanonicalPath string
 	FileInfo      os.FileInfo
 	Executable    bool
+	Format        executableFormat
 	Mount         mountStatus
 	Usable        bool
 	Warning       string
@@ -451,6 +461,10 @@ func inspectCanonicalExecutable(result executableDiscovery) executableDiscovery 
 		return result
 	}
 	result.Executable = true
+	result.Format, err = inspectExecutableFormat(result.CanonicalPath)
+	if err != nil {
+		result.Warning = fmt.Sprintf("inspect executable format for catalog executable %q: %v", result.CatalogName, err)
+	}
 
 	result.Mount, err = inspectMount(result.CanonicalPath)
 	if err != nil {
@@ -462,6 +476,26 @@ func inspectCanonicalExecutable(result executableDiscovery) executableDiscovery 
 		result.Warning = fmt.Sprintf("catalog executable %q is on a noexec filesystem", result.CatalogName)
 	}
 	return result
+}
+
+func inspectExecutableFormat(path string) (executableFormat, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return executableFormatUnknown, err
+	}
+	defer file.Close()
+	var header [4]byte
+	n, err := io.ReadFull(file, header[:])
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return executableFormatUnknown, err
+	}
+	if n >= 2 && header[0] == '#' && header[1] == '!' {
+		return executableFormatScript, nil
+	}
+	if n == len(header) && header[0] == 0x7f && header[1] == 'E' && header[2] == 'L' && header[3] == 'F' {
+		return executableFormatELF, nil
+	}
+	return executableFormatUnknown, nil
 }
 
 func inspectMount(path string) (mountStatus, error) {
@@ -586,6 +620,14 @@ func evaluateSUID(input suidEvaluationInput) applicabilityResult {
 		states = append(states, stateUnknown)
 		evidence = append(evidence, "canonical target file information could not be determined")
 	} else {
+		switch input.Format {
+		case executableFormatScript:
+			states = append(states, stateUnavailable)
+			evidence = append(evidence, "interpreter scripts ignore the setuid bit on Linux")
+		case executableFormatUnknown:
+			states = append(states, stateUnknown)
+			evidence = append(evidence, "executable format could not be verified")
+		}
 		if !input.Regular {
 			states = append(states, stateUnavailable)
 			evidence = append(evidence, "canonical target is not a regular file")
@@ -887,6 +929,7 @@ func evaluateContext(contextKey string, contextList []string, version string, di
 		return composeApplicabilityResults(common, evaluateSUID(suidEvaluationInput{
 			FileInspected:   fileInspected,
 			Regular:         regular,
+			Format:          discovery.Format,
 			Mode:            mode,
 			OwnerUIDKnown:   ownerKnown,
 			OwnerUID:        ownerUID,
