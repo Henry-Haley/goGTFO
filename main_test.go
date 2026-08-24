@@ -1110,23 +1110,89 @@ func TestEvaluateSUID(t *testing.T) {
 
 func TestInspectExecutableFormat(t *testing.T) {
 	dir := t.TempDir()
-	elf := filepath.Join(dir, "elf")
-	if err := os.WriteFile(elf, []byte{0x7f, 'E', 'L', 'F', 2}, 0o700); err != nil {
+	valid, err := os.Executable()
+	if err != nil {
 		t.Fatal(err)
 	}
 	script := filepath.Join(dir, "script")
 	if err := os.WriteFile(script, []byte("#!/bin/sh\necho fixture\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	other := filepath.Join(dir, "other")
-	if err := os.WriteFile(other, []byte("fixture"), 0o700); err != nil {
+	magicOnly := filepath.Join(dir, "magic-only")
+	if err := os.WriteFile(magicOnly, []byte{0x7f, 'E', 'L', 'F'}, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	for path, want := range map[string]executableFormat{elf: executableFormatELF, script: executableFormatScript, other: executableFormatUnknown} {
+	truncated := filepath.Join(dir, "truncated")
+	if err := os.WriteFile(truncated, []byte{0x7f, 'E', 'L', 'F', 2, 1}, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	malformed := filepath.Join(dir, "malformed")
+	if err := os.WriteFile(malformed, []byte{0x7f, 'E', 'L', 'F', 99, 99, 99, 99, 99, 99, 99, 99}, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	unknown := filepath.Join(dir, "unknown")
+	if err := os.WriteFile(unknown, []byte("fixture"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	empty := filepath.Join(dir, "empty")
+	if err := os.WriteFile(empty, nil, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	validLink := filepath.Join(dir, "valid-link")
+	scriptLink := filepath.Join(dir, "script-link")
+	malformedLink := filepath.Join(dir, "malformed-link")
+	for link, target := range map[string]string{validLink: valid, scriptLink: script, malformedLink: malformed} {
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	paths := map[string]executableFormat{
+		valid:         executableFormatELF,
+		script:        executableFormatScript,
+		magicOnly:     executableFormatMalformedELF,
+		truncated:     executableFormatMalformedELF,
+		malformed:     executableFormatMalformedELF,
+		unknown:       executableFormatUnknown,
+		empty:         executableFormatUnknown,
+		validLink:     executableFormatELF,
+		scriptLink:    executableFormatScript,
+		malformedLink: executableFormatMalformedELF,
+	}
+	for path, want := range paths {
 		got, err := inspectExecutableFormat(path)
 		if err != nil || got != want {
 			t.Fatalf("inspectExecutableFormat(%q) = %v, %v; want %v", path, got, err, want)
 		}
+	}
+}
+
+func TestSUIDFormatSafety(t *testing.T) {
+	tests := []struct {
+		name   string
+		format executableFormat
+		mode   os.FileMode
+		uid    uint32
+		want   applicabilityState
+		events string
+	}{
+		{"valid ELF", executableFormatELF, 0o755 | os.ModeSetuid, 0, stateConfirmed, ""},
+		{"malformed ELF", executableFormatMalformedELF, 0o755 | os.ModeSetuid, 0, stateUnknown, "ELF header could not be validated"},
+		{"interpreter script", executableFormatScript, 0o755 | os.ModeSetuid, 0, stateUnavailable, "interpreter scripts ignore"},
+		{"unknown format", executableFormatUnknown, 0o755 | os.ModeSetuid, 0, stateUnknown, "executable format could not be verified"},
+		{"SGID-only ELF", executableFormatELF, 0o755 | os.ModeSetgid, 0, stateUnavailable, "does not have setuid bit"},
+		{"non-root ELF", executableFormatELF, 0o755 | os.ModeSetuid, 1000, stateUnavailable, "owner UID is 1000"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := validSUIDEvaluationInput()
+			input.Format = tt.format
+			input.Mode = tt.mode
+			input.OwnerUID = tt.uid
+			got := evaluateSUID(input)
+			if got.State != tt.want || (tt.events != "" && !warningContains(got.Evidence, tt.events)) {
+				t.Fatalf("evaluateSUID() = %#v, want %q containing %q", got, tt.want, tt.events)
+			}
+		})
 	}
 }
 

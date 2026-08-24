@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"debug/elf"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -100,6 +101,7 @@ const (
 	executableFormatUnknown executableFormat = iota
 	executableFormatELF
 	executableFormatScript
+	executableFormatMalformedELF
 )
 
 type fileCapabilities struct {
@@ -516,6 +518,14 @@ func inspectExecutableFormat(path string) (executableFormat, error) {
 		return executableFormatScript, nil
 	}
 	if n == len(header) && header[0] == 0x7f && header[1] == 'E' && header[2] == 'L' && header[3] == 'F' {
+		parsed, err := elf.Open(path)
+		if err != nil {
+			return executableFormatMalformedELF, nil
+		}
+		defer parsed.Close()
+		if parsed.Type != elf.ET_EXEC && parsed.Type != elf.ET_DYN {
+			return executableFormatMalformedELF, nil
+		}
 		return executableFormatELF, nil
 	}
 	return executableFormatUnknown, nil
@@ -647,6 +657,9 @@ func evaluateSUID(input suidEvaluationInput) applicabilityResult {
 		case executableFormatScript:
 			states = append(states, stateUnavailable)
 			evidence = append(evidence, "interpreter scripts ignore the setuid bit on Linux")
+		case executableFormatMalformedELF:
+			states = append(states, stateUnknown)
+			evidence = append(evidence, "ELF header could not be validated as a loadable executable")
 		case executableFormatUnknown:
 			states = append(states, stateUnknown)
 			evidence = append(evidence, "executable format could not be verified")
