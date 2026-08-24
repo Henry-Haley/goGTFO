@@ -2244,7 +2244,7 @@ func TestEvaluateFindingsIntegratesContexts(t *testing.T) {
 		{FunctionKey: "command", ContextKey: "future-context", ContextLabel: "Future", Code: "future-code"},
 	}}
 	capabilities := map[string]fileCapabilityInspection{
-		path: {Known: true, Present: true, Capabilities: fileCapabilities{Permitted: required, Effective: true}},
+		"Tool": {Known: true, Present: true, Capabilities: fileCapabilities{Permitted: required, Effective: true}},
 	}
 
 	evaluated := evaluateFindings([]finding{base}, []executableDiscovery{discovery}, host, sudoProbeBatch{}, capabilities)
@@ -2284,7 +2284,7 @@ func TestEvaluateFindingsIntegratesContexts(t *testing.T) {
 	})
 
 	t.Run("capability missing and unknown requirements", func(t *testing.T) {
-		missing := map[string]fileCapabilityInspection{path: {Known: true}}
+		missing := map[string]fileCapabilityInspection{"Tool": {Known: true}}
 		result := evaluateFindings([]finding{base}, []executableDiscovery{discovery}, host, sudoProbeBatch{}, missing)[0]
 		if value := techniqueNamed(t, result, "command", "capabilities"); value.State != stateUnavailable || !warningContains(value.Evidence, "not present") {
 			t.Fatalf("missing capability result = %#v", value)
@@ -2362,7 +2362,7 @@ func TestInheritanceAndCompanionUncertainty(t *testing.T) {
 	}
 }
 
-func TestCapabilityInspectionCache(t *testing.T) {
+func TestCapabilityInspectionFallbackIsKeyedByCatalogName(t *testing.T) {
 	findings := []finding{
 		{Name: "A", Techniques: []technique{{ContextKey: "capabilities"}}},
 		{Name: "B", Techniques: []technique{{ContextKey: "capabilities"}}},
@@ -2380,8 +2380,60 @@ func TestCapabilityInspectionCache(t *testing.T) {
 		calls[path]++
 		return fileCapabilityInspection{Known: true}
 	})
-	if len(cache) != 2 || calls["/Canonical/Shared"] != 1 || calls["/Canonical/D"] != 1 || calls["/Canonical/C"] != 0 {
+	if len(cache) != 3 || calls["/Canonical/Shared"] != 2 || calls["/Canonical/D"] != 1 || calls["/Canonical/C"] != 0 {
 		t.Fatalf("capability cache/calls = %#v/%v", cache, calls)
+	}
+	for _, name := range []string{"A", "B", "D"} {
+		if _, ok := cache[name]; !ok {
+			t.Fatalf("capability fallback missing logical discovery %q: %#v", name, cache)
+		}
+	}
+}
+
+func TestCapabilityEvidenceStaysBoundToDiscovery(t *testing.T) {
+	required := uint64(1) << unix.CAP_SETUID
+	host := hostSnapshot{procStatus: procStatus{NoNewPrivsKnown: true, CapBndKnown: true, CapBnd: required}}
+	makeFinding := func(name string) finding {
+		return finding{Name: name, Techniques: []technique{{FunctionKey: "command", ContextKey: "capabilities", ContextList: []string{"CAP_SETUID"}}}}
+	}
+	discovery := func(name string, capability fileCapabilityInspection) executableDiscovery {
+		value := staticDiscovery(name, "/same/path/"+name, "/same/path/shared", 0o755, mountStatus{Known: true})
+		value.Capabilities = capability
+		value.CapabilitiesInspected = true
+		return value
+	}
+	known := fileCapabilityInspection{Known: true, Present: true, Capabilities: fileCapabilities{Permitted: required, Effective: true}}
+	tests := []struct {
+		name         string
+		a, b         fileCapabilityInspection
+		wantA, wantB applicabilityState
+		reverse      bool
+	}{
+		{"required versus absent", known, fileCapabilityInspection{Known: true}, stateConfirmed, stateUnavailable, false},
+		{"absent versus required", fileCapabilityInspection{Known: true}, known, stateUnavailable, stateConfirmed, true},
+		{"required versus unknown", known, fileCapabilityInspection{}, stateConfirmed, stateUnknown, false},
+		{"different permitted masks", known, fileCapabilityInspection{Known: true, Present: true, Capabilities: fileCapabilities{Permitted: 0, Effective: true}}, stateConfirmed, stateUnavailable, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			findings := []finding{makeFinding("A"), makeFinding("B")}
+			discoveries := []executableDiscovery{discovery("A", tt.a), discovery("B", tt.b)}
+			if tt.reverse {
+				slices.Reverse(findings)
+				slices.Reverse(discoveries)
+			}
+			// Deliberately provide contradictory path-keyed evidence. Descriptor-bound
+			// discovery data must win and cannot be shared through the pathname.
+			capabilities := map[string]fileCapabilityInspection{"/same/path/shared": tt.b}
+			got := evaluateFindings(findings, discoveries, host, sudoProbeBatch{}, capabilities)
+			states := map[string]applicabilityState{}
+			for _, value := range got {
+				states[value.Name] = value.Techniques[0].State
+			}
+			if states["A"] != tt.wantA || states["B"] != tt.wantB {
+				t.Fatalf("states = %#v, want A=%q B=%q", states, tt.wantA, tt.wantB)
+			}
+		})
 	}
 }
 
@@ -2764,7 +2816,7 @@ func TestPlainOutputGolden(t *testing.T) {
 		Results:  map[string]sudoProbeResult{toolPath: {Status: sudoProbeRecognized}},
 	}
 	capabilities := map[string]fileCapabilityInspection{
-		toolPath: {Known: true, Present: true, Capabilities: fileCapabilities{Effective: true}},
+		"fixture-tool": {Known: true, Present: true, Capabilities: fileCapabilities{Effective: true}},
 	}
 	evaluated := evaluateFindings(selected, discoveries, host, sudoBatch, capabilities)
 	report := filterFindings(evaluated, true)

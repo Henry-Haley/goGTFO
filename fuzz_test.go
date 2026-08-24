@@ -7,9 +7,12 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func FuzzProcStatusSemantics(f *testing.F) {
@@ -142,6 +145,45 @@ func FuzzOptionParsing(f *testing.F) {
 		value, err := parseOptions(args)
 		if err == nil && value.Sort != sortBinary && value.Sort != sortContext && value.Sort != sortAttack {
 			t.Fatalf("invalid sort accepted: %q", value.Sort)
+		}
+	})
+}
+
+func FuzzCapabilityDiscoveryIsolation(f *testing.F) {
+	required := uint64(1) << unix.CAP_SETUID
+	f.Add(required, uint64(0), true, true, true, false)
+	f.Add(uint64(0), required, true, true, false, true)
+	f.Fuzz(func(t *testing.T, aMask, bMask uint64, aKnown, bKnown, aEffective, bEffective bool) {
+		host := hostSnapshot{procStatus: procStatus{NoNewPrivsKnown: true, CapBndKnown: true, CapBnd: required}}
+		makeDiscovery := func(name string, mask uint64, known, effective bool) executableDiscovery {
+			value := staticDiscovery(name, "/fuzz/"+name, "/fuzz/shared", 0o755, mountStatus{Known: true})
+			value.CapabilitiesInspected = true
+			value.Capabilities = fileCapabilityInspection{
+				Known: known, Present: known,
+				Capabilities: fileCapabilities{Permitted: mask, Effective: effective},
+			}
+			return value
+		}
+		makeFinding := func(name string) finding {
+			return finding{Name: name, Techniques: []technique{{FunctionKey: "command", ContextKey: "capabilities", ContextList: []string{"CAP_SETUID"}}}}
+		}
+		findings := []finding{makeFinding("A"), makeFinding("B")}
+		discoveries := []executableDiscovery{makeDiscovery("A", aMask, aKnown, aEffective), makeDiscovery("B", bMask, bKnown, bEffective)}
+		first := evaluateFindings(findings, discoveries, host, sudoProbeBatch{}, map[string]fileCapabilityInspection{"/fuzz/shared": {Known: true, Present: true, Capabilities: fileCapabilities{Permitted: required, Effective: true}}})
+		if len(first) != 2 {
+			t.Fatalf("first evaluation returned %d findings", len(first))
+		}
+		firstA := first[0].Techniques[0]
+
+		// Change only B's descriptor-bound evidence. A's result must be identical.
+		discoveries[1].Capabilities = fileCapabilityInspection{Known: !bKnown, Present: !bKnown, Capabilities: fileCapabilities{Permitted: ^required, Effective: !bEffective}}
+		second := evaluateFindings(findings, discoveries, host, sudoProbeBatch{}, nil)
+		if len(second) != 2 {
+			t.Fatalf("second evaluation returned %d findings", len(second))
+		}
+		secondA := second[0].Techniques[0]
+		if firstA.State != secondA.State || !reflect.DeepEqual(firstA.Evidence, secondA.Evidence) {
+			t.Fatalf("A changed when B changed: before=%#v after=%#v", firstA, secondA)
 		}
 	})
 }
