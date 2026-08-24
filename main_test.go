@@ -789,7 +789,7 @@ func TestCaptureHostSnapshot(t *testing.T) {
 	}
 	t.Setenv("PATH", dir)
 
-	snapshot := captureHostSnapshotAt(statusPath, true)
+	snapshot := captureHostSnapshotAtWithSudoResolver(statusPath, true, func() (string, error) { return filepath.Join(dir, "sudo"), nil })
 	if snapshot.RealUID != os.Getuid() || snapshot.EffectiveUID != os.Geteuid() {
 		t.Fatalf("UID snapshot = real %d effective %d", snapshot.RealUID, snapshot.EffectiveUID)
 	}
@@ -823,8 +823,36 @@ func TestCaptureHostSnapshotRejectsErrDotSudo(t *testing.T) {
 	t.Setenv("PATH", ".")
 
 	snapshot := captureHostSnapshotAt(statusPath, false)
-	if snapshot.SudoPresent || !warningContains(snapshot.Warnings, "current directory") {
+	if snapshot.SudoPresent || !warningContains(snapshot.Warnings, "not safely available") {
 		t.Fatalf("ErrDot sudo snapshot = %#v", snapshot)
+	}
+}
+
+func TestLocateTrustedSudoRejectsUntrustedPath(t *testing.T) {
+	dir := t.TempDir()
+	writeTestExecutable(t, dir, "sudo")
+	t.Setenv("PATH", dir)
+	if path, err := locateTrustedSudo(); err == nil {
+		t.Fatalf("untrusted sudo path accepted: %q", path)
+	}
+
+	t.Chdir(dir)
+	t.Setenv("PATH", ".")
+	if path, err := locateTrustedSudo(); err == nil {
+		t.Fatalf("relative sudo path accepted: %q", path)
+	}
+}
+
+func TestLocateTrustedSudoFindsTrustedSystemSudo(t *testing.T) {
+	path, err := locateTrustedSudo()
+	if err != nil {
+		t.Skipf("trusted sudo unavailable: %v", err)
+	}
+	if !filepath.IsAbs(path) || filepath.Base(path) != "sudo" {
+		t.Fatalf("trusted sudo path = %q", path)
+	}
+	if err := trustedFile(path); err != nil {
+		t.Fatalf("trusted sudo failed validation: %v", err)
 	}
 }
 
@@ -1375,13 +1403,13 @@ func TestProbeSudoPoliciesRunnerOutcomes(t *testing.T) {
 			sudoPath := fakeSudoPath(t)
 			canonicalPath := "/canonical/Fixture Tool"
 			calls := 0
-			batch := probeSudoPolicies(context.Background(), true, []executableDiscovery{{CanonicalPath: canonicalPath}}, func(_ context.Context, gotSudo, gotCanonical string) error {
+			batch := probeSudoPoliciesWithResolver(context.Background(), true, []executableDiscovery{{CanonicalPath: canonicalPath}}, func(_ context.Context, gotSudo, gotCanonical string) error {
 				calls++
 				if gotSudo != sudoPath || gotCanonical != canonicalPath {
 					t.Fatalf("runner arguments = %q, %q; want %q, %q", gotSudo, gotCanonical, sudoPath, canonicalPath)
 				}
 				return tt.err
-			})
+			}, func() (string, error) { return sudoPath, nil })
 			if calls != 1 || batch.SudoPath != sudoPath || batch.LookupErr != nil || batch.Results[canonicalPath].Status != tt.status {
 				t.Fatalf("probe batch = %#v, calls = %d", batch, calls)
 			}
@@ -1396,10 +1424,10 @@ func TestProbeSudoPoliciesUsesOnlyCanonicalPath(t *testing.T) {
 	catalogCommand := "fixture-command | must-never-run"
 	discoveries := []executableDiscovery{{InvocablePath: invocablePath, CanonicalPath: canonicalPath}}
 	var received string
-	probeSudoPolicies(context.Background(), true, discoveries, func(_ context.Context, _, path string) error {
+	probeSudoPoliciesWithResolver(context.Background(), true, discoveries, func(_ context.Context, _, path string) error {
 		received = path
 		return nil
-	})
+	}, func() (string, error) { return filepath.Join(t.TempDir(), "sudo"), nil })
 	if received != canonicalPath || received == invocablePath || received == catalogCommand {
 		t.Fatalf("runner received %q, want canonical path %q only", received, canonicalPath)
 	}
@@ -1419,7 +1447,7 @@ func TestProbeSudoPoliciesCachesCanonicalPaths(t *testing.T) {
 		calls[path]++
 		return nil
 	}
-	first := probeSudoPolicies(context.Background(), true, discoveries, runner)
+	first := probeSudoPoliciesWithResolver(context.Background(), true, discoveries, runner, func() (string, error) { return filepath.Join(t.TempDir(), "sudo"), nil })
 	if calls["/canonical/shared"] != 1 || calls["/canonical/other"] != 1 || len(calls) != 2 || len(first.Results) != 2 {
 		t.Fatalf("cache calls/results = %v/%v", calls, first.Results)
 	}
@@ -1434,10 +1462,10 @@ func TestProbeSudoPoliciesCachesCanonicalPaths(t *testing.T) {
 	}
 
 	secondCalls := 0
-	second := probeSudoPolicies(context.Background(), true, discoveries, func(context.Context, string, string) error {
+	second := probeSudoPoliciesWithResolver(context.Background(), true, discoveries, func(context.Context, string, string) error {
 		secondCalls++
 		return nil
-	})
+	}, func() (string, error) { return first.SudoPath, nil })
 	if secondCalls != 2 || !reflect.DeepEqual(first.Results, second.Results) {
 		t.Fatalf("repeated cache is not deterministic: calls %d, first %v, second %v", secondCalls, first.Results, second.Results)
 	}
@@ -1453,10 +1481,10 @@ func TestProbeSudoPoliciesGlobalBudget(t *testing.T) {
 			{CanonicalPath: "/canonical/two"},
 		}
 		calls := 0
-		batch := probeSudoPolicies(ctx, true, discoveries, func(context.Context, string, string) error {
+		batch := probeSudoPoliciesWithResolver(ctx, true, discoveries, func(context.Context, string, string) error {
 			calls++
 			return nil
-		})
+		}, func() (string, error) { return filepath.Join(t.TempDir(), "sudo"), nil })
 		if calls != 0 {
 			t.Fatalf("runner called %d times after budget expiration", calls)
 		}
@@ -1487,11 +1515,11 @@ func TestProbeSudoPoliciesGlobalBudget(t *testing.T) {
 			{CanonicalPath: "/canonical/also-unstarted"},
 		}
 		calls := 0
-		batch := probeSudoPolicies(ctx, true, discoveries, func(context.Context, string, string) error {
+		batch := probeSudoPoliciesWithResolver(ctx, true, discoveries, func(context.Context, string, string) error {
 			calls++
 			cancel()
 			return nil
-		})
+		}, func() (string, error) { return filepath.Join(t.TempDir(), "sudo"), nil })
 		if calls != 1 {
 			t.Fatalf("runner called %d times, want 1", calls)
 		}
@@ -1548,10 +1576,24 @@ func TestProbeSudoPoliciesLookupFailures(t *testing.T) {
 			calls++
 			return nil
 		})
-		if calls != 0 || batch.SudoPath != "" || !errors.Is(batch.LookupErr, exec.ErrDot) {
+		if calls != 0 || batch.SudoPath != "" || batch.LookupErr == nil || !warningContains([]string{batch.LookupErr.Error()}, "not safely available") {
 			t.Fatalf("unsafe sudo result: calls=%d batch=%#v", calls, batch)
 		}
 	})
+}
+
+func TestProbeSudoPoliciesDoesNotUseUntrustedCandidate(t *testing.T) {
+	dir := t.TempDir()
+	writeTestExecutable(t, dir, "sudo")
+	t.Setenv("PATH", dir)
+	calls := 0
+	batch := probeSudoPolicies(context.Background(), true, []executableDiscovery{{CanonicalPath: "/canonical/fixture"}}, func(context.Context, string, string) error {
+		calls++
+		return nil
+	})
+	if calls != 0 || batch.SudoPath != "" || batch.LookupErr == nil {
+		t.Fatalf("untrusted sudo was probed: calls=%d batch=%#v", calls, batch)
+	}
 }
 
 func TestHelpDocumentsCheckSudo(t *testing.T) {

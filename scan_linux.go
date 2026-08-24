@@ -277,6 +277,10 @@ func captureHostSnapshot(sudoProbeRequested bool) hostSnapshot {
 }
 
 func captureHostSnapshotAt(statusPath string, sudoProbeRequested bool) hostSnapshot {
+	return captureHostSnapshotAtWithSudoResolver(statusPath, sudoProbeRequested, locateTrustedSudo)
+}
+
+func captureHostSnapshotAtWithSudoResolver(statusPath string, sudoProbeRequested bool, resolve func() (string, error)) hostSnapshot {
 	snapshot := hostSnapshot{
 		RealUID:            os.Getuid(),
 		EffectiveUID:       os.Geteuid(),
@@ -295,12 +299,84 @@ func captureHostSnapshotAt(statusPath string, sudoProbeRequested bool) hostSnaps
 		}
 	}
 
-	if _, err := exec.LookPath("sudo"); err == nil {
+	if _, err := resolve(); err == nil {
 		snapshot.SudoPresent = true
-	} else if errors.Is(err, exec.ErrDot) {
-		snapshot.Warnings = append(snapshot.Warnings, "sudo was rejected because PATH resolved it through the current directory")
+	} else {
+		snapshot.Warnings = append(snapshot.Warnings, err.Error())
 	}
 	return snapshot
+}
+
+func locateTrustedSudo() (string, error) {
+	seen := make(map[string]bool)
+	for _, rawDir := range strings.Split(os.Getenv("PATH"), string(os.PathListSeparator)) {
+		if rawDir == "" || !filepath.IsAbs(rawDir) {
+			continue
+		}
+		dir, err := filepath.EvalSymlinks(rawDir)
+		if err != nil || seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		if err := trustedDirectory(dir); err != nil {
+			continue
+		}
+
+		candidate := filepath.Join(dir, "sudo")
+		canonical, err := filepath.EvalSymlinks(candidate)
+		if err != nil || !filepath.IsAbs(canonical) {
+			continue
+		}
+		if err := trustedDirectory(filepath.Dir(canonical)); err != nil || trustedFile(canonical) != nil {
+			continue
+		}
+		return canonical, nil
+	}
+	return "", errors.New("sudo was not safely available in PATH")
+}
+
+func trustedDirectory(path string) error {
+	for current := filepath.Clean(path); ; current = filepath.Dir(current) {
+		info, err := os.Stat(current)
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("%q is not a directory", current)
+		}
+		uid, ok := canonicalOwnerUID(info)
+		if !ok || uid != 0 {
+			return fmt.Errorf("%q is not root-owned", current)
+		}
+		if info.Mode().Perm()&022 != 0 {
+			return fmt.Errorf("%q is writable by group or other", current)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return nil
+		}
+	}
+}
+
+func trustedFile(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%q is not a regular file", path)
+	}
+	uid, ok := canonicalOwnerUID(info)
+	if !ok || uid != 0 {
+		return fmt.Errorf("%q is not root-owned", path)
+	}
+	if info.Mode().Perm()&0111 == 0 {
+		return fmt.Errorf("%q is not executable", path)
+	}
+	if info.Mode().Perm()&022 != 0 {
+		return fmt.Errorf("%q is writable by group or other", path)
+	}
+	return nil
 }
 
 func searchCatalogName(executables map[string]executableDef, query string) (catalogSearchResult, error) {
@@ -981,18 +1057,17 @@ func sudoProbeBatchStatus(requested bool, batch sudoProbeBatch) string {
 }
 
 func probeSudoPolicies(parent context.Context, requested bool, discoveries []executableDiscovery, runner sudoRunner) sudoProbeBatch {
+	return probeSudoPoliciesWithResolver(parent, requested, discoveries, runner, locateTrustedSudo)
+}
+
+func probeSudoPoliciesWithResolver(parent context.Context, requested bool, discoveries []executableDiscovery, runner sudoRunner, resolve func() (string, error)) sudoProbeBatch {
 	if !requested {
 		return sudoProbeBatch{}
 	}
 
-	sudoPath, err := exec.LookPath("sudo")
+	sudoPath, err := resolve()
 	if err != nil {
-		if errors.Is(err, exec.ErrDot) {
-			err = fmt.Errorf("locate sudo: unsafe current-directory PATH result: %w", err)
-		} else {
-			err = fmt.Errorf("locate sudo: %w", err)
-		}
-		return sudoProbeBatch{LookupErr: err}
+		return sudoProbeBatch{LookupErr: fmt.Errorf("locate sudo: %w", err)}
 	}
 
 	ctx, cancel := context.WithTimeout(parent, sudoProbeBudget)
