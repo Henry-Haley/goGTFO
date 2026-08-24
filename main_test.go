@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"debug/elf"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -1221,6 +1222,76 @@ func TestInspectExecutableFormat(t *testing.T) {
 		if err != nil || got != want {
 			t.Fatalf("inspectExecutableFormat(%q) = %v, %v; want %v", path, got, err, want)
 		}
+	}
+}
+
+func writeELFProgramHeaderFixture(t *testing.T, path string, types ...elf.ProgType) {
+	t.Helper()
+	data := make([]byte, 64+56*len(types))
+	copy(data, []byte{0x7f, 'E', 'L', 'F', 2, 1, 1})
+	binary.LittleEndian.PutUint16(data[16:18], uint16(elf.ET_DYN))
+	binary.LittleEndian.PutUint16(data[18:20], uint16(elf.EM_X86_64))
+	binary.LittleEndian.PutUint32(data[20:24], 1)
+	binary.LittleEndian.PutUint64(data[32:40], 64)
+	binary.LittleEndian.PutUint16(data[52:54], 64)
+	binary.LittleEndian.PutUint16(data[54:56], 56)
+	binary.LittleEndian.PutUint16(data[56:58], uint16(len(types)))
+	for index, typ := range types {
+		offset := 64 + index*56
+		binary.LittleEndian.PutUint32(data[offset:offset+4], uint32(typ))
+	}
+	if err := os.WriteFile(path, data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInspectExecutableFormatRequiresLoadableSegment(t *testing.T) {
+	dir := t.TempDir()
+	noteOnly := filepath.Join(dir, "note-only")
+	writeELFProgramHeaderFixture(t, noteOnly, elf.PT_NOTE)
+	if got, err := inspectExecutableFormat(noteOnly); err != nil || got != executableFormatMalformedELF {
+		t.Fatalf("PT_NOTE-only ELF = %v, %v; want malformed ELF", got, err)
+	}
+
+	mixed := filepath.Join(dir, "mixed")
+	writeELFProgramHeaderFixture(t, mixed, elf.PT_NOTE, elf.PT_LOAD)
+	if got, err := inspectExecutableFormat(mixed); err != nil || got != executableFormatELF {
+		t.Fatalf("mixed PT_NOTE/PT_LOAD ELF = %v, %v; want ELF", got, err)
+	}
+}
+
+func TestSUIDFormatEndToEndRejectsNoteOnlyELF(t *testing.T) {
+	dir := t.TempDir()
+	noteOnly := filepath.Join(dir, "note-only")
+	writeELFProgramHeaderFixture(t, noteOnly, elf.PT_NOTE)
+
+	noteDiscovery := inspectCanonicalExecutable(executableDiscovery{CatalogName: "note-only", Found: true, InvocablePath: noteOnly, CanonicalPath: noteOnly})
+	noteDiscovery.FileInfo = staticFileInfo{name: "note-only", mode: 0o755 | os.ModeSetuid, uid: 0}
+	noteResult := evaluateContext("suid", nil, "", noteDiscovery, hostSnapshot{procStatus: procStatus{NoNewPrivsKnown: true}}, sudoProbeBatch{}, nil)
+	if noteResult.State == stateConfirmed {
+		t.Fatalf("PT_NOTE-only SUID became confirmed: %#v", noteResult)
+	}
+
+	validPath, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	validData, err := os.ReadFile(validPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validFixture := filepath.Join(dir, "valid")
+	if err := os.WriteFile(validFixture, validData, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	validDiscovery := inspectCanonicalExecutable(executableDiscovery{CatalogName: "valid", Found: true, InvocablePath: validFixture, CanonicalPath: validFixture})
+	if validDiscovery.FileInfo == nil || validDiscovery.Format != executableFormatELF {
+		t.Fatalf("real ELF discovery = %#v", validDiscovery)
+	}
+	validDiscovery.FileInfo = staticFileInfo{name: "valid", mode: 0o755 | os.ModeSetuid, uid: 0}
+	validResult := evaluateContext("suid", nil, "", validDiscovery, hostSnapshot{procStatus: procStatus{NoNewPrivsKnown: true}}, sudoProbeBatch{}, nil)
+	if validResult.State != stateConfirmed {
+		t.Fatalf("real ELF SUID control = %#v", validResult)
 	}
 }
 
