@@ -605,7 +605,7 @@ func inspectMount(path string) (mountStatus, error) {
 	if err := unix.Statfs(path, &stat); err != nil {
 		return mountStatus{}, err
 	}
-	return interpretMountFlags(stat.Flags), nil
+	return interpretMountFlags(int64(stat.Flags)), nil
 }
 
 func interpretMountFlags(flags int64) mountStatus {
