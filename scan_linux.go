@@ -46,6 +46,9 @@ const (
 	vfsCapabilityRevision2Size        = 20
 	vfsCapabilityRevision3Size        = 24
 	sudoProbeBudget                   = 20 * time.Second
+	// USER_NS_INIT_INO from linux/uapi/linux/nsfs.h identifies the initial
+	// user namespace in procfs nsfs metadata.
+	initialUserNamespaceInode uint64 = 0xeffffffd
 )
 
 type applicabilityResult struct {
@@ -387,21 +390,37 @@ func locateTrustedSudo() (string, error) {
 }
 
 func trustedUserNamespace() error {
-	data, err := os.ReadFile("/proc/self/uid_map")
-	if err != nil {
-		return fmt.Errorf("read /proc/self/uid_map: %w", err)
-	}
-	return trustedUserNamespaceFrom(data)
+	return trustedUserNamespaceAt("/proc/self/ns/user")
 }
 
-func trustedUserNamespaceFrom(data []byte) error {
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(lines) != 1 {
-		return errors.New("UID mapping is not a single initial-namespace mapping")
+func trustedUserNamespaceAt(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open user namespace: %w", err)
 	}
-	fields := strings.Fields(lines[0])
-	if len(fields) != 3 || fields[0] != "0" || fields[1] != "0" || fields[2] != "4294967295" {
-		return errors.New("UID mapping is not the initial namespace mapping")
+	defer file.Close()
+
+	namespaceType, err := unix.IoctlRetInt(int(file.Fd()), unix.NS_GET_NSTYPE)
+	if err != nil {
+		return fmt.Errorf("inspect user namespace type: %w", err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("stat user namespace: %w", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat == nil {
+		return errors.New("user namespace inode is unavailable")
+	}
+	return trustedUserNamespaceIdentity(namespaceType, stat.Ino)
+}
+
+func trustedUserNamespaceIdentity(namespaceType int, inode uint64) error {
+	if namespaceType != unix.CLONE_NEWUSER {
+		return errors.New("namespace descriptor is not a user namespace")
+	}
+	if inode != initialUserNamespaceInode {
+		return errors.New("user namespace is not the initial namespace")
 	}
 	return nil
 }

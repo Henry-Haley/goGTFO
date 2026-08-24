@@ -887,26 +887,85 @@ func TestLocateTrustedSudoFindsTrustedSystemSudo(t *testing.T) {
 	}
 }
 
-func TestTrustedUserNamespace(t *testing.T) {
-	for name, data := range map[string]string{
-		"initial":    "         0          0 4294967295\n",
-		"nested":     "         0       1000          1\n",
-		"multi-line": "0 0 4294967295\n1 1 1\n",
-		"malformed":  "not a mapping\n",
+func TestTrustedUserNamespaceIdentity(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		namespaceType int
+		inode         uint64
+		wantTrusted   bool
+	}{
+		{"initial namespace", unix.CLONE_NEWUSER, initialUserNamespaceInode, true},
+		{"ordinary nested namespace", unix.CLONE_NEWUSER, initialUserNamespaceInode + 1, false},
+		{"identity-mapped nested namespace", unix.CLONE_NEWUSER, initialUserNamespaceInode + 2, false},
+		{"namespace root remains nested", unix.CLONE_NEWUSER, initialUserNamespaceInode + 3, false},
+		{"unsupported namespace descriptor", 0, initialUserNamespaceInode, false},
+		{"malformed namespace metadata", unix.CLONE_NEWUSER, 0, false},
 	} {
-		t.Run(name, func(t *testing.T) {
-			err := trustedUserNamespaceFrom([]byte(data))
-			if name == "initial" {
-				if err != nil {
-					t.Fatalf("initial mapping rejected: %v", err)
-				}
-				return
-			}
-			if err == nil {
-				t.Fatal("non-initial mapping accepted")
+		t.Run(tt.name, func(t *testing.T) {
+			err := trustedUserNamespaceIdentity(tt.namespaceType, tt.inode)
+			if (err == nil) != tt.wantTrusted {
+				t.Fatalf("trustedUserNamespaceIdentity(%#x, %d) = %v, wantTrusted %v", tt.namespaceType, tt.inode, err, tt.wantTrusted)
 			}
 		})
 	}
+}
+
+func TestTrustedUserNamespaceProductionPath(t *testing.T) {
+	info, err := os.Stat("/proc/self/ns/user")
+	if err != nil {
+		t.Skipf("user namespace metadata unavailable: %v", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat == nil {
+		t.Skip("user namespace inode unavailable")
+	}
+	err = trustedUserNamespace()
+	if (err == nil) != (stat.Ino == initialUserNamespaceInode) {
+		t.Fatalf("trustedUserNamespace() = %v for inode %d", err, stat.Ino)
+	}
+
+	if err := trustedUserNamespaceAt(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("unavailable namespace evidence was trusted")
+	}
+	if err := trustedUserNamespaceAt(t.TempDir()); err == nil {
+		t.Fatal("non-namespace descriptor was trusted")
+	}
+}
+
+func TestNestedUserNamespaceProductionPath(t *testing.T) {
+	const childMode = "GOGTFO_TEST_USER_NAMESPACE"
+	if mode := os.Getenv(childMode); mode != "" {
+		if err := trustedUserNamespace(); err == nil {
+			t.Fatalf("%s nested user namespace was trusted", mode)
+		}
+		host := captureHostSnapshot(false)
+		suid := validSUIDEvaluationInput()
+		suid.UserNamespaceKnown = host.UserNamespaceKnown
+		suid.InitialUserNamespace = host.InitialUserNamespace
+		if got := evaluateSUID(suid); got.State == stateConfirmed {
+			t.Fatalf("%s nested SUID applicability = %#v", mode, got)
+		}
+		capabilities := validCapabilityEvaluationInput()
+		capabilities.UserNamespaceKnown = host.UserNamespaceKnown
+		capabilities.InitialUserNamespace = host.InitialUserNamespace
+		if got := evaluateCapabilities(capabilities); got.State == stateConfirmed {
+			t.Fatalf("%s nested capability applicability = %#v", mode, got)
+		}
+		return
+	}
+
+	run := func(mode string, args ...string) {
+		command := exec.Command("unshare", append(args, os.Args[0], "-test.run=^TestNestedUserNamespaceProductionPath$")...)
+		command.Env = append(os.Environ(), childMode+"="+mode)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Skipf("%s namespace integration unavailable: %v: %s", mode, err, output)
+		}
+	}
+	run("ordinary", "-Ur", "--fork", "--")
+	if os.Geteuid() != 0 {
+		t.Skip("identity-mapped namespace integration requires root")
+	}
+	run("identity-mapped", "-U", "--map-users", "0:0:4294967295", "--map-groups", "0:0:4294967295", "--setgroups", "allow", "--fork", "--")
 }
 
 func TestLocateTrustedSudoRejectsSymlinkAndWritableCandidates(t *testing.T) {
