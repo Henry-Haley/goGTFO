@@ -318,6 +318,9 @@ func captureHostSnapshotAtWithSudoResolver(statusPath string, sudoProbeRequested
 }
 
 func locateTrustedSudo() (string, error) {
+	if err := trustedUserNamespace(); err != nil {
+		return "", fmt.Errorf("sudo trust requires the initial user namespace: %w", err)
+	}
 	seen := make(map[string]bool)
 	for _, rawDir := range strings.Split(os.Getenv("PATH"), string(os.PathListSeparator)) {
 		if rawDir == "" || !filepath.IsAbs(rawDir) {
@@ -343,6 +346,26 @@ func locateTrustedSudo() (string, error) {
 		return canonical, nil
 	}
 	return "", errors.New("sudo was not safely available in PATH")
+}
+
+func trustedUserNamespace() error {
+	data, err := os.ReadFile("/proc/self/uid_map")
+	if err != nil {
+		return fmt.Errorf("read /proc/self/uid_map: %w", err)
+	}
+	return trustedUserNamespaceFrom(data)
+}
+
+func trustedUserNamespaceFrom(data []byte) error {
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 1 {
+		return errors.New("UID mapping is not a single initial-namespace mapping")
+	}
+	fields := strings.Fields(lines[0])
+	if len(fields) != 3 || fields[0] != "0" || fields[1] != "0" || fields[2] != "4294967295" {
+		return errors.New("UID mapping is not the initial namespace mapping")
+	}
+	return nil
 }
 
 func trustedDirectory(path string) error {

@@ -856,6 +856,82 @@ func TestLocateTrustedSudoFindsTrustedSystemSudo(t *testing.T) {
 	}
 }
 
+func TestTrustedUserNamespace(t *testing.T) {
+	for name, data := range map[string]string{
+		"initial":    "         0          0 4294967295\n",
+		"nested":     "         0       1000          1\n",
+		"multi-line": "0 0 4294967295\n1 1 1\n",
+		"malformed":  "not a mapping\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := trustedUserNamespaceFrom([]byte(data))
+			if name == "initial" {
+				if err != nil {
+					t.Fatalf("initial mapping rejected: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("non-initial mapping accepted")
+			}
+		})
+	}
+}
+
+func TestLocateTrustedSudoRejectsSymlinkAndWritableCandidates(t *testing.T) {
+	dir := t.TempDir()
+	fake := writeTestExecutable(t, dir, "fake-sudo")
+	paths := map[string]string{
+		"direct fake":            filepath.Join(dir, "sudo"),
+		"file symlink":           filepath.Join(dir, "file-link"),
+		"multi-hop file symlink": filepath.Join(dir, "file-link-2"),
+		"broken symlink":         filepath.Join(dir, "broken"),
+	}
+	if err := os.Rename(fake, paths["direct fake"]); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(paths["direct fake"], paths["file symlink"]); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(paths["file symlink"], paths["multi-hop file symlink"]); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dir, "missing"), paths["broken symlink"]); err != nil {
+		t.Fatal(err)
+	}
+	for name, candidate := range paths {
+		t.Run(name, func(t *testing.T) {
+			pathDir := t.TempDir()
+			if name == "direct fake" {
+				pathDir = dir
+			}
+			t.Setenv("PATH", pathDir)
+			if name != "direct fake" {
+				if err := os.Symlink(candidate, filepath.Join(pathDir, "sudo")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if found, err := locateTrustedSudo(); err == nil {
+				t.Fatalf("untrusted candidate accepted: %q", found)
+			}
+		})
+	}
+
+	for _, mode := range []os.FileMode{0o775, 0o777} {
+		writable := filepath.Join(t.TempDir(), "nested")
+		if err := os.Mkdir(writable, mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(writable, "sudo"), []byte("fixture"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", writable)
+		if found, err := locateTrustedSudo(); err == nil {
+			t.Fatalf("writable ancestor accepted: mode=%o path=%q", mode, found)
+		}
+	}
+}
+
 func writeTestExecutable(t *testing.T, dir, name string) string {
 	t.Helper()
 
